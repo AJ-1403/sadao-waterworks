@@ -11,10 +11,27 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
+/* ข้อ 2.4: SaveState รวมสถานะของ mutation — idle/saving/success/error */
+type SaveState = "idle" | "saving" | "success" | "error";
+
 export function StaffPage() {
   const [staff, setStaff] = useState<Staff[]>([]);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
+  // ข้อ 2.4/2.5: SaveState + กัน double-submit สำหรับ createStaff
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [message, setMessage] = useState("");
+
+  /* ข้อ 2.4: แสดงข้อความสำเร็จค้างไว้ 2.5 วินาทีแล้วกลับสู่ idle */
+  function flashSuccess(text: string) {
+    setSaveState("success");
+    setMessage(text);
+
+    setTimeout(() => {
+      setSaveState("idle");
+      setMessage("");
+    }, 2500);
+  }
 
   async function loadStaff() {
     try {
@@ -33,6 +50,11 @@ export function StaffPage() {
     const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
     const form = new FormData(formElement);
 
+    // ข้อ 2.5: กัน double-submit
+    if (saveState === "saving") return;
+
+    setSaveState("saving");
+
     try {
       await api("createStaff", {
         username: form.get("username"),
@@ -44,9 +66,14 @@ export function StaffPage() {
 
       setOpen(false);
       formElement.reset();
+      flashSuccess("เพิ่มพนักงานสำเร็จ");
       await loadStaff();
     } catch (error) {
       setError(error instanceof Error ? error.message : "เพิ่มพนักงานไม่สำเร็จ");
+      setSaveState("error");
+    } finally {
+      // ข้อ 2.4: รับประกันสถานะไม่ค้างที่ "saving" เสมอ
+      setSaveState((state) => (state === "saving" ? "idle" : state));
     }
   }
 
@@ -91,8 +118,13 @@ export function StaffPage() {
                 <Label>รหัสผ่าน</Label>
                 <Input name="password" type="password" required />
               </div>
-              <Button type="submit" className="w-full bg-teal-600 hover:bg-teal-700">
-                บันทึกข้อมูล
+              <Button
+                type="submit"
+                disabled={saveState === "saving"}
+                className="w-full bg-teal-600 hover:bg-teal-700"
+              >
+                {/* ข้อ 2.4/2.5: disable ระหว่าง saving กัน double-submit */}
+                {saveState === "saving" ? "กำลังบันทึกข้อมูล..." : "บันทึกข้อมูล"}
               </Button>
             </form>
           </DialogContent>
@@ -100,6 +132,11 @@ export function StaffPage() {
       </div>
 
       {error && <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+
+      {/* ข้อ 2.4: แสดงข้อความสำเร็จ (inline แทน toast library) */}
+      {saveState === "success" && message && (
+        <p className="rounded-md bg-emerald-50 p-3 text-sm text-emerald-700">{message}</p>
+      )}
 
       <Card>
         <CardHeader>
