@@ -11,7 +11,8 @@ export function middleware(request: NextRequest) {
     pathname.startsWith("/bills") ||
     pathname.startsWith("/payments") ||
     pathname.startsWith("/reports") ||
-    pathname.startsWith("/settings");
+    pathname.startsWith("/settings") ||
+    pathname.startsWith("/payment-channel");
 
   if (protectedPath && !token) {
     const loginUrl = new URL("/login", request.url);
@@ -35,6 +36,7 @@ export const config = {
     "/payments/:path*",
     "/reports/:path*",
     "/settings/:path*",
+    "/payment-channel/:path*",
     "/login",
   ],
 };

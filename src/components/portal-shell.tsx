@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  QrCode,
   Settings,
   UserCog,
   Users,
@@ -56,6 +57,12 @@ const menuItems: MenuItem[] = [
     label: "รับชำระเงิน",
     icon: WalletCards,
     roles: ["admin", "staff", "member"],
+  },
+  {
+    href: "/payment-channel",
+    label: "ช่องทางชำระเงิน",
+    icon: QrCode,
+    roles: ["member"],
   },
   {
     href: "/reports",

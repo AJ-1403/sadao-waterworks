@@ -86,8 +86,43 @@ export type DashboardData = {
     member?: Member;
 };
 
+export type PaymentChannel = {
+  bankId: string;
+  bankName: string;
+  accountName: string;
+  accountNo: string;
+  qrCodeUrl: string;
+  active: boolean | string;
+};
+
+export type Receipt = {
+  receiptNo: string;
+  paidAt: string;
+  paymentMethod: "cash" | "transfer";
+  amount: number;
+  receivedByName: string;
+  bill: {
+    billNo: string;
+    billingPeriod: string;
+    houseNo: string;
+    ownerName: string;
+    previousMeter: number;
+    currentMeter: number;
+    unitsUsed: number;
+    waterAmount: number;
+    serviceFee: number;
+    vatAmount: number;
+    totalAmount: number;
+  };
+  village: {
+    villageName: string;
+    villageAddress: string;
+    villagePhone: string;
+  };
+};
+
 export type SettingsData = {
-    village: Record<string, string>;
+  village: Record<string, string>;
     bankAccounts: {
         bankId: string;
         bankName: string;

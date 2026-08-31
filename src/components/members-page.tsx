@@ -1,22 +1,43 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { Plus, RefreshCw } from "lucide-react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Edit, Plus, Power, RefreshCw, Search } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Member } from "@/types";
 import { useUser } from "@/components/providers";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+
+function isActive(value: boolean | string) {
+  return value === true || value === "true" || value === "TRUE";
+}
 
 export function MembersPage() {
   const user = useUser();
   const [members, setMembers] = useState<Member[]>([]);
+  const [selectedMember, setSelectedMember] = useState<Member | null>(null);
+  const [search, setSearch] = useState("");
   const [error, setError] = useState("");
-  const [open, setOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
 
   async function loadMembers() {
     try {
@@ -30,6 +51,19 @@ export function MembersPage() {
   useEffect(() => {
     loadMembers();
   }, []);
+
+  const filteredMembers = useMemo(() => {
+    const keyword = search.trim().toLowerCase();
+
+    if (!keyword) return members;
+
+    return members.filter((member) =>
+      [member.houseNo, member.fullName, member.phone]
+        .join(" ")
+        .toLowerCase()
+        .includes(keyword)
+    );
+  }, [members, search]);
 
   async function createMember(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -45,12 +79,65 @@ export function MembersPage() {
         password: form.get("password"),
       });
 
-      setOpen(false);
       event.currentTarget.reset();
+      setCreateOpen(false);
       await loadMembers();
     } catch (error) {
       setError(error instanceof Error ? error.message : "เพิ่มลูกบ้านไม่สำเร็จ");
     }
+  }
+
+  async function updateMember(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!selectedMember) return;
+
+    const form = new FormData(event.currentTarget);
+
+    try {
+      await api("updateMember", {
+        memberId: selectedMember.memberId,
+        houseNo: form.get("houseNo"),
+        fullName: form.get("fullName"),
+        phone: form.get("phone"),
+        address: form.get("address"),
+        initialMeter: Number(form.get("initialMeter") || 0),
+        password: form.get("password") || undefined,
+      });
+
+      setEditOpen(false);
+      setSelectedMember(null);
+      await loadMembers();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "แก้ไขข้อมูลไม่สำเร็จ");
+    }
+  }
+
+  async function toggleStatus(member: Member) {
+    const active = isActive(member.active);
+    const confirmed = window.confirm(
+      active
+        ? `ต้องการปิดใช้งานบ้านเลขที่ ${member.houseNo} ใช่หรือไม่?`
+        : `ต้องการเปิดใช้งานบ้านเลขที่ ${member.houseNo} ใช่หรือไม่?`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      await api("toggleMemberStatus", {
+        memberId: member.memberId,
+        active: !active,
+      });
+
+      await loadMembers();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "เปลี่ยนสถานะไม่สำเร็จ");
+    }
+  }
+
+  function openEdit(member: Member) {
+    setSelectedMember(member);
+    setEditOpen(true);
   }
 
   return (
@@ -58,17 +145,19 @@ export function MembersPage() {
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
         <div>
           <h1 className="text-2xl font-bold">ข้อมูลลูกบ้าน</h1>
-          <p className="text-sm text-muted-foreground">จัดการข้อมูลผู้ใช้น้ำในหมู่บ้าน</p>
+          <p className="text-sm text-muted-foreground">
+            จัดการข้อมูลผู้ใช้น้ำในหมู่บ้าน
+          </p>
         </div>
 
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={loadMembers}>
             <RefreshCw className="mr-2 h-4 w-4" />
             รีเฟรช
           </Button>
 
           {user.role === "admin" && (
-            <Dialog open={open} onOpenChange={setOpen}>
+            <Dialog open={createOpen} onOpenChange={setCreateOpen}>
               <DialogTrigger asChild>
                 <Button className="bg-teal-600 hover:bg-teal-700">
                   <Plus className="mr-2 h-4 w-4" />
@@ -100,13 +189,21 @@ export function MembersPage() {
                   </div>
                   <div className="space-y-2">
                     <Label>เลขมิเตอร์เริ่มต้น</Label>
-                    <Input name="initialMeter" type="number" min="0" defaultValue="0" />
+                    <Input
+                      name="initialMeter"
+                      type="number"
+                      min="0"
+                      defaultValue="0"
+                    />
                   </div>
                   <div className="space-y-2">
                     <Label>รหัสผ่านสำหรับลูกบ้าน</Label>
                     <Input name="password" type="password" required />
                   </div>
-                  <Button type="submit" className="w-full bg-teal-600 hover:bg-teal-700">
+                  <Button
+                    type="submit"
+                    className="w-full bg-teal-600 hover:bg-teal-700"
+                  >
                     บันทึกข้อมูล
                   </Button>
                 </form>
@@ -116,12 +213,29 @@ export function MembersPage() {
         </div>
       </div>
 
-      {error && <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+      {error && (
+        <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">
+          {error}
+        </p>
+      )}
 
       <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">ลูกบ้านทั้งหมด ({members.length})</CardTitle>
+        <CardHeader className="gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <CardTitle className="text-lg">
+            ลูกบ้านทั้งหมด ({filteredMembers.length})
+          </CardTitle>
+
+          <div className="relative w-full sm:w-72">
+            <Search className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
+            <Input
+              className="pl-9"
+              placeholder="ค้นหาบ้านเลขที่, ชื่อ, เบอร์โทร"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </div>
         </CardHeader>
+
         <CardContent className="overflow-x-auto">
           <Table>
             <TableHeader>
@@ -130,21 +244,66 @@ export function MembersPage() {
                 <TableHead>ชื่อ-นามสกุล</TableHead>
                 <TableHead>เบอร์โทร</TableHead>
                 <TableHead>เลขมิเตอร์เริ่มต้น</TableHead>
+                <TableHead>สถานะ</TableHead>
+                {user.role === "admin" && (
+                  <TableHead className="text-right">จัดการ</TableHead>
+                )}
               </TableRow>
             </TableHeader>
+
             <TableBody>
-              {members.map((member) => (
-                <TableRow key={member.memberId}>
-                  <TableCell className="font-medium">{member.houseNo}</TableCell>
-                  <TableCell>{member.fullName}</TableCell>
-                  <TableCell>{member.phone || "-"}</TableCell>
-                  <TableCell>{member.initialMeter}</TableCell>
-                </TableRow>
-              ))}
-              {members.length === 0 && (
+              {filteredMembers.map((member) => {
+                const active = isActive(member.active);
+
+                return (
+                  <TableRow key={member.memberId}>
+                    <TableCell className="font-medium">
+                      {member.houseNo}
+                    </TableCell>
+                    <TableCell>{member.fullName}</TableCell>
+                    <TableCell>{member.phone || "-"}</TableCell>
+                    <TableCell>{member.initialMeter}</TableCell>
+                    <TableCell>
+                      {active ? (
+                        <Badge className="bg-emerald-600">ใช้งาน</Badge>
+                      ) : (
+                        <Badge variant="secondary">ปิดใช้งาน</Badge>
+                      )}
+                    </TableCell>
+
+                    {user.role === "admin" && (
+                      <TableCell>
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => openEdit(member)}
+                          >
+                            <Edit className="mr-1 h-4 w-4" />
+                            แก้ไข
+                          </Button>
+                          <Button
+                            variant={active ? "destructive" : "secondary"}
+                            size="sm"
+                            onClick={() => toggleStatus(member)}
+                          >
+                            <Power className="mr-1 h-4 w-4" />
+                            {active ? "ปิดใช้" : "เปิดใช้"}
+                          </Button>
+                        </div>
+                      </TableCell>
+                    )}
+                  </TableRow>
+                );
+              })}
+
+              {filteredMembers.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">
-                    ยังไม่มีข้อมูลลูกบ้าน
+                  <TableCell
+                    colSpan={user.role === "admin" ? 6 : 5}
+                    className="py-8 text-center text-muted-foreground"
+                  >
+                    ไม่พบข้อมูลลูกบ้าน
                   </TableCell>
                 </TableRow>
               )}
@@ -152,6 +311,68 @@ export function MembersPage() {
           </Table>
         </CardContent>
       </Card>
+
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>
+              แก้ไขข้อมูลบ้านเลขที่ {selectedMember?.houseNo}
+            </DialogTitle>
+          </DialogHeader>
+
+          {selectedMember && (
+            <form onSubmit={updateMember} className="space-y-4">
+              <div className="space-y-2">
+                <Label>บ้านเลขที่</Label>
+                <Input
+                  name="houseNo"
+                  defaultValue={selectedMember.houseNo}
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>ชื่อ-นามสกุล</Label>
+                <Input
+                  name="fullName"
+                  defaultValue={selectedMember.fullName}
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>เบอร์โทรศัพท์</Label>
+                <Input name="phone" defaultValue={selectedMember.phone} />
+              </div>
+              <div className="space-y-2">
+                <Label>ที่อยู่</Label>
+                <Input name="address" defaultValue={selectedMember.address} />
+              </div>
+              <div className="space-y-2">
+                <Label>เลขมิเตอร์เริ่มต้น</Label>
+                <Input
+                  name="initialMeter"
+                  type="number"
+                  min="0"
+                  defaultValue={selectedMember.initialMeter}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>รหัสผ่านใหม่</Label>
+                <Input
+                  name="password"
+                  type="password"
+                  placeholder="เว้นว่างหากไม่ต้องการเปลี่ยน"
+                />
+              </div>
+              <Button
+                type="submit"
+                className="w-full bg-teal-600 hover:bg-teal-700"
+              >
+                บันทึกการแก้ไข
+              </Button>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

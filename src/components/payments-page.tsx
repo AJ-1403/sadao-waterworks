@@ -1,10 +1,12 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { CreditCard, Plus } from "lucide-react";
+import { FormEvent, useEffect, useRef, useState } from "react";
+import { CreditCard, Plus, Printer } from "lucide-react";
+import { useReactToPrint } from "react-to-print";
 import { api, money, thaiDate } from "@/lib/api";
-import type { Bill, Payment } from "@/types";
+import type { Bill, Payment, Receipt } from "@/types";
 import { useUser } from "@/components/providers";
+import { ReceiptDocument } from "@/components/receipt-document";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
@@ -20,6 +22,27 @@ export function PaymentsPage() {
   const [unpaidBills, setUnpaidBills] = useState<Bill[]>([]);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
+  const [receipt, setReceipt] = useState<Receipt | null>(null);
+  const receiptRef = useRef<HTMLDivElement>(null);
+
+  const handlePrint = useReactToPrint({
+    contentRef: receiptRef,
+    documentTitle: receipt ? `ใบเสร็จ-${receipt.receiptNo}` : "ใบเสร็จรับเงิน",
+  });
+
+  async function printReceipt(paymentId: string) {
+    try {
+      const data = await api<Receipt>("getReceipt", { paymentId });
+
+      setReceipt(data);
+
+      setTimeout(() => {
+        handlePrint();
+      }, 150);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "ไม่สามารถสร้างใบเสร็จได้");
+    }
+  }
 
   async function loadData() {
     try {
@@ -152,6 +175,7 @@ export function PaymentsPage() {
                 <TableHead>จำนวนเงิน</TableHead>
                 <TableHead>วิธีชำระ</TableHead>
                 <TableHead>วันที่รับเงิน</TableHead>
+                <TableHead className="text-right">ใบเสร็จ</TableHead>
                 {user.role !== "member" && <TableHead>ผู้รับเงิน</TableHead>}
               </TableRow>
             </TableHeader>
@@ -166,6 +190,16 @@ export function PaymentsPage() {
                     {payment.paymentMethod === "cash" ? "เงินสด" : "โอนเงิน"}
                   </TableCell>
                   <TableCell>{thaiDate(payment.paidAt)}</TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => printReceipt(payment.paymentId)}
+                    >
+                      <Printer className="mr-1 h-4 w-4" />
+                      พิมพ์
+                    </Button>
+                  </TableCell>
                   {user.role !== "member" && <TableCell>{payment.receivedByName}</TableCell>}
                 </TableRow>
               ))}
@@ -173,6 +207,10 @@ export function PaymentsPage() {
           </Table>
         </CardContent>
       </Card>
+
+      <div className="hidden">
+        {receipt && <ReceiptDocument ref={receiptRef} receipt={receipt} />}
+      </div>
     </div>
   );
 }
