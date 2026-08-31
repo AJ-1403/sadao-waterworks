@@ -1,11 +1,14 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { callGas } from "@/lib/gas";
-import { SESSION_COOKIE_NAME } from "@/lib/auth";
+import { SESSION_COOKIE_NAME, invalidateUserCache } from "@/lib/auth";
 
 export async function POST() {
   const cookieStore = await cookies();
   const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
+
+  // ล้าง profile cache ทันที เพื่อให้ layout ไม่ใช้ user จาก cache เก่า
+  invalidateUserCache(token);
 
   try {
     if (token) {

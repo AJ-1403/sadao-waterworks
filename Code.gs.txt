@@ -284,7 +284,7 @@ function dispatchAction_(request) {
       return recordPayment_(context, request);
 
     case "listPayments":
-      return listPayments_(context);
+      return listPayments_(context, request);
 
     case "getReceipt":
       return getReceipt_(context, request);
@@ -333,19 +333,37 @@ function login_(request) {
     throw new Error("กรุณาระบุ Username และ Password");
   }
 
+  // rate limiting: ล็อกชั่วคราวถ้า login ผิดติดกันเกิน MAX_LOGIN_FAILURES ครั้ง
+  checkLoginRateLimit_(username);
+
   const user = findOne_("Users", function (row) {
     return String(row.username).toLowerCase() === username.toLowerCase();
   });
 
   if (!user || !isActive_(user.active)) {
+    registerLoginFailure_(username);
     throw new Error("Username หรือ Password ไม่ถูกต้อง");
   }
 
-  if (hashPassword_(password, user.passwordSalt) !== user.passwordHash) {
+  const passwordCheck = verifyPassword_(password, user.passwordSalt, user.passwordHash);
+
+  if (!passwordCheck.ok) {
+    registerLoginFailure_(username);
     throw new Error("Username หรือ Password ไม่ถูกต้อง");
   }
 
-  deleteExpiredSessions_();
+  // migration: ถ้า hash เดิมเป็นแบบ single-round ให้อัปเกรดเป็น multi-round ทันที
+  if (passwordCheck.legacy) {
+    updateObject_("Users", user.__row, {
+      passwordHash: hashPassword_(password, user.passwordSalt),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  clearLoginFailures_(username);
+
+  // ย้ายการลบ session หมดอายุไปรันผ่าน time-based trigger (setupDailyMaintenanceTrigger)
+  // แทนการสแกน/ลบ Sessions ทุกครั้งที่ login — requireAuth_ ลบ session หมดอายุรายตัวอยู่แล้ว
 
   const sessionDays = number_(
     getProperty_("SESSION_DAYS") || CONFIG.DEFAULT_SESSION_DAYS
@@ -1005,6 +1023,13 @@ function listBills_(context, request) {
   const status = String(request.status || "").trim();
   const billingPeriod = String(request.billingPeriod || "").trim();
 
+  // pagination options (backward-compatible: ไม่ส่ง param = ได้ทั้งหมดเหมือนเดิม)
+  const listOptions = {
+    limit: request.limit,
+    offset: request.offset,
+    maxRows: request.maxRows,
+  };
+
   let bills = allObjects_("Bills");
 
   if (context.user.role === "member") {
@@ -1029,7 +1054,7 @@ function listBills_(context, request) {
     });
   }
 
-  return bills.sort(function (a, b) {
+  const sorted = bills.sort(function (a, b) {
     const periodCompare = String(b.billingPeriod).localeCompare(
       String(a.billingPeriod)
     );
@@ -1040,6 +1065,15 @@ function listBills_(context, request) {
 
     return String(b.createdAt).localeCompare(String(a.createdAt));
   });
+
+  const offset = Math.max(0, number_(listOptions.offset));
+  const limit = number_(listOptions.limit) || number_(listOptions.maxRows);
+
+  if (offset > 0 || limit > 0) {
+    return sorted.slice(offset, limit > 0 ? offset + limit : undefined);
+  }
+
+  return sorted;
 }
 
 function addBillDisplayFields_(bill) {
@@ -1086,15 +1120,19 @@ function createBill_(context, request) {
       throw new Error("รอบบิลต้องอยู่ในรูปแบบ YYYY-MM เช่น 2026-08");
     }
 
-    const member = findOne_("Members", function (row) {
+    // อ่านตารางที่เกี่ยวข้องครั้งเดียว (ใช้ execution cache) แล้วใช้ซ้ำทุกการเช็ค
+    const members = allObjects_("Members");
+    const bills = allObjects_("Bills");
+
+    const member = members.find(function (row) {
       return row.memberId === memberId;
-    });
+    }) || null;
 
     if (!member || !isActive_(member.active)) {
       throw new Error("ไม่พบลูกบ้าน หรือบัญชีลูกบ้านถูกปิดใช้งาน");
     }
 
-    const duplicateBill = findOne_("Bills", function (row) {
+    const duplicateBill = bills.find(function (row) {
       return (
         row.memberId === memberId &&
         row.billingPeriod === billingPeriod &&
@@ -1106,7 +1144,7 @@ function createBill_(context, request) {
       throw new Error("ลูกบ้านรายนี้มีบิลในรอบ " + billingPeriod + " แล้ว");
     }
 
-    const latestBill = allObjects_("Bills")
+    const latestBill = bills
       .filter(function (bill) {
         return bill.memberId === memberId && bill.status !== "cancelled";
       })
@@ -1130,7 +1168,7 @@ function createBill_(context, request) {
     const charge = calculateWaterCharge_(unitsUsed, billingPeriod + "-01");
     const now = new Date().toISOString();
     const billId = "BIL-" + Utilities.getUuid();
-    const billNo = generateBillNo_(billingPeriod);
+    const billNo = generateBillNo_(billingPeriod, bills);
 
     appendObject_("Bills", {
       billId: billId,
@@ -1191,26 +1229,35 @@ function calculateWaterCharge_(unitsUsed, billingDate) {
   let waterAmount = 0;
 
   if (rateMode === "tiered") {
+    // นิยาม tier: [unitStart, unitEnd] แบบ inclusive (หน่วยที่ 1 คือหน่วยแรกเสมอ)
+    // แก้ off-by-one เดิม 2 จุด:
+    //   1) unitStart = 0 เดิมนับ "หน่วยที่ 0" ที่ไม่มีอยู่จริงเพิ่มมา 1 หน่วย (+1 ผิด)
+    //   2) tier ที่ช่วง overlap กันเดิมนับซ้ำ — ใช้ตัวนับ consumed กันนับซ้ำ
+    let consumed = 0;
+
     rates
       .slice()
       .sort(function (a, b) {
         return number_(a.unitStart) - number_(b.unitStart);
       })
       .forEach(function (rate) {
-        const start = number_(rate.unitStart);
+        const start = Math.max(1, number_(rate.unitStart));
         const end =
           rate.unitEnd === "" || rate.unitEnd === null
             ? Infinity
             : number_(rate.unitEnd);
 
-        if (unitsUsed < start) {
+        if (end < start) {
           return;
         }
 
-        const unitsInTier = Math.min(unitsUsed, end) - start + 1;
+        const tierFrom = Math.max(start, consumed + 1);
+        const tierTo = Math.min(unitsUsed, end);
+        const unitsInTier = tierTo - tierFrom + 1;
 
         if (unitsInTier > 0) {
           waterAmount += unitsInTier * number_(rate.pricePerUnit);
+          consumed = Math.max(consumed, tierTo);
         }
       });
   } else {
@@ -1254,9 +1301,13 @@ function recordPayment_(context, request) {
       throw new Error("วิธีชำระเงินไม่ถูกต้อง");
     }
 
-    const bill = findOne_("Bills", function (row) {
+    // อ่านตารางครั้งเดียว ใช้ซ้ำทั้งหาบิลและ generate เลขที่รับเงิน
+    const bills = allObjects_("Bills");
+    const payments = allObjects_("Payments");
+
+    const bill = bills.find(function (row) {
       return row.billId === billId;
-    });
+    }) || null;
 
     if (!bill) {
       throw new Error("ไม่พบบิลที่ต้องการรับชำระ");
@@ -1286,7 +1337,7 @@ function recordPayment_(context, request) {
 
     const now = new Date().toISOString();
     const paymentId = "PAY-" + Utilities.getUuid();
-    const paymentNo = generatePaymentNo_();
+    const paymentNo = generatePaymentNo_(payments);
 
     appendObject_("Payments", {
       paymentId: paymentId,
@@ -1333,7 +1384,9 @@ function recordPayment_(context, request) {
   });
 }
 
-function listPayments_(context) {
+function listPayments_(context, request) {
+  const options = request || {};
+
   let payments = allObjects_("Payments");
 
   if (context.user.role === "member") {
@@ -1342,7 +1395,7 @@ function listPayments_(context) {
     });
   }
 
-  return payments
+  const sorted = payments
     .map(function (payment) {
       payment.amount = number_(payment.amount);
       return payment;
@@ -1350,6 +1403,15 @@ function listPayments_(context) {
     .sort(function (a, b) {
       return String(b.paidAt).localeCompare(String(a.paidAt));
     });
+
+  const offset = Math.max(0, number_(options.offset));
+  const limit = number_(options.limit) || number_(options.maxRows);
+
+  if (offset > 0 || limit > 0) {
+    return sorted.slice(offset, limit > 0 ? offset + limit : undefined);
+  }
+
+  return sorted;
 }
 
 function getReceipt_(context, request) {
@@ -1722,27 +1784,53 @@ function getActiveRates_(billingDate) {
 
 /* ==========================================================================
    DOCUMENT NUMBERS
+   ใช้ counter ใน Settings sheet (key: SEQ_*) เพิ่มแบบ atomic ภายใต้ withLock_
+   แทนการสแกนทั้งตารางเพื่อนับจำนวน — seed ครั้งแรกจากจำนวนแถวจริงเพื่อ backward-compatible
    ========================================================================== */
 
-function generateBillNo_(billingPeriod) {
-  const compactPeriod = billingPeriod.replace("-", "");
-  const count =
-    allObjects_("Bills").filter(function (bill) {
-      return bill.billingPeriod === billingPeriod;
-    }).length + 1;
+function nextSequence_(key, seedCount) {
+  // ต้องถูกเรียกภายใต้ withLock_ เท่านั้น เพื่อให้การเพิ่มค่าเป็น atomic
+  const existing = findOne_("Settings", function (row) {
+    return row.key === key;
+  });
 
-  return "WB-" + compactPeriod + "-" + padNumber_(count, 4);
+  let current = number_(existing ? existing.value : 0);
+
+  // migration: ถ้า counter ยังไม่เคยถูกใช้ ให้ seed จากจำนวนแถวที่มีอยู่จริง
+  if (current < number_(seedCount)) {
+    current = number_(seedCount);
+  }
+
+  current += 1;
+  setSetting_(key, String(current));
+
+  return current;
 }
 
-function generatePaymentNo_() {
+function generateBillNo_(billingPeriod, billRows) {
+  const compactPeriod = billingPeriod.replace("-", "");
+  const rows = billRows || allObjects_("Bills");
+
+  const existingCount = rows.filter(function (bill) {
+    return bill.billingPeriod === billingPeriod;
+  }).length;
+
+  const seq = nextSequence_("SEQ_BILL_" + compactPeriod, existingCount);
+
+  return "WB-" + compactPeriod + "-" + padNumber_(seq, 4);
+}
+
+function generatePaymentNo_(paymentRows) {
   const period = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyyMM");
+  const rows = paymentRows || allObjects_("Payments");
 
-  const count =
-    allObjects_("Payments").filter(function (payment) {
-      return String(payment.paymentNo || "").indexOf("RC-" + period + "-") === 0;
-    }).length + 1;
+  const existingCount = rows.filter(function (payment) {
+    return String(payment.paymentNo || "").indexOf("RC-" + period + "-") === 0;
+  }).length;
 
-  return "RC-" + period + "-" + padNumber_(count, 4);
+  const seq = nextSequence_("SEQ_PAYMENT_" + period, existingCount);
+
+  return "RC-" + period + "-" + padNumber_(seq, 4);
 }
 
 /* ==========================================================================
@@ -1769,7 +1857,25 @@ function logAudit_(context, action, targetType, targetId, detail) {
    GOOGLE SHEET DATABASE
    ========================================================================== */
 
+/* ==========================================================================
+   EXECUTION-LEVEL CACHE
+   เก็บ Spreadsheet / Sheet / ข้อมูลแถวที่อ่านแล้วต่อ 1 execution
+   (ลดการเรียก SpreadsheetApp.openById() / getValues() ซ้ำ ๆ ทำให้เร็วขึ้นมาก)
+   ========================================================================== */
+
+let spreadsheetCache_ = null;
+const sheetCache_ = {};
+const objectsCache_ = {};
+
+function invalidateObjectsCache_(sheetName) {
+  delete objectsCache_[sheetName];
+}
+
 function getSpreadsheet_() {
+  if (spreadsheetCache_) {
+    return spreadsheetCache_;
+  }
+
   const configuredId = String(CONFIG.SPREADSHEET_ID || "").trim();
   const savedId = String(getProperty_("SPREADSHEET_ID") || "").trim();
 
@@ -1781,7 +1887,8 @@ function getSpreadsheet_() {
 
   if (spreadsheetId) {
     try {
-      return SpreadsheetApp.openById(spreadsheetId);
+      spreadsheetCache_ = SpreadsheetApp.openById(spreadsheetId);
+      return spreadsheetCache_;
     } catch (error) {
       throw new Error(
         "ไม่สามารถเปิด Google Sheet ได้ กรุณาตรวจสอบ SPREADSHEET_ID และสิทธิ์เข้าถึงไฟล์"
@@ -1793,7 +1900,8 @@ function getSpreadsheet_() {
     const activeSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
     if (activeSpreadsheet) {
-      return activeSpreadsheet;
+      spreadsheetCache_ = activeSpreadsheet;
+      return spreadsheetCache_;
     }
   } catch (error) {
     // กรณีเป็น Standalone script จะไม่มีไฟล์ที่เปิดอยู่
@@ -1854,32 +1962,63 @@ function formatHeader_(sheet, columnCount) {
 }
 
 function getSheet_(sheetName) {
-  return ensureSheet_(sheetName);
-}
-
-function allObjects_(sheetName) {
-  const sheet = getSheet_(sheetName);
-  const headers = SCHEMAS[sheetName];
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < 2) {
-    return [];
+  // เช็ค header ครั้งเดียวต่อ 1 execution ต่อ 1 ชีตเท่านั้น
+  if (sheetCache_[sheetName]) {
+    return sheetCache_[sheetName];
   }
 
-  const values = sheet
-    .getRange(2, 1, lastRow - 1, headers.length)
-    .getValues();
+  const sheet = ensureSheet_(sheetName);
+  sheetCache_[sheetName] = sheet;
+  return sheet;
+}
 
-  return values.map(function (row, index) {
-    const item = {
-      __row: index + 2,
-    };
+function allObjects_(sheetName, options) {
+  // memoization ต่อ 1 execution: ถ้าอ่านชีตเดิมไปแล้วให้ใช้ค่าที่อ่านไว้
+  // (คืนเป็น shallow copy เสมอ เพื่อกัน caller แก้ข้อมูลใน cache)
+  if (!objectsCache_[sheetName]) {
+    const sheet = getSheet_(sheetName);
+    const headers = SCHEMAS[sheetName];
+    const lastRow = sheet.getLastRow();
 
-    headers.forEach(function (header, columnIndex) {
-      item[header] = normalizeCell_(header, row[columnIndex]);
-    });
+    if (lastRow < 2) {
+      objectsCache_[sheetName] = [];
+    } else {
+      const values = sheet
+        .getRange(2, 1, lastRow - 1, headers.length)
+        .getValues();
 
-    return item;
+      objectsCache_[sheetName] = values.map(function (row, index) {
+        const item = {
+          __row: index + 2,
+        };
+
+        headers.forEach(function (header, columnIndex) {
+          item[header] = normalizeCell_(header, row[columnIndex]);
+        });
+
+        return item;
+      });
+    }
+  }
+
+  const cached = objectsCache_[sheetName];
+  const opts = options || {};
+  const offset = Math.max(0, number_(opts.offset));
+  const limit =
+    opts.limit !== undefined && opts.limit !== null && opts.limit !== ""
+      ? number_(opts.limit)
+      : number_(opts.maxRows);
+
+  if (offset > 0 || limit > 0) {
+    return cached
+      .slice(offset, limit > 0 ? offset + limit : undefined)
+      .map(function (row) {
+        return Object.assign({}, row);
+      });
+  }
+
+  return cached.map(function (row) {
+    return Object.assign({}, row);
   });
 }
 
@@ -1904,6 +2043,7 @@ function appendObject_(sheetName, object) {
   });
 
   sheet.appendRow(row);
+  invalidateObjectsCache_(sheetName);
 }
 
 function updateObject_(sheetName, rowNumber, updates) {
@@ -1918,10 +2058,12 @@ function updateObject_(sheetName, rowNumber, updates) {
   });
 
   sheet.getRange(rowNumber, 1, 1, headers.length).setValues([newValues]);
+  invalidateObjectsCache_(sheetName);
 }
 
 function deleteRow_(sheetName, rowNumber) {
   getSheet_(sheetName).deleteRow(rowNumber);
+  invalidateObjectsCache_(sheetName);
 }
 
 function withLock_(callback) {
@@ -2052,30 +2194,125 @@ function validateApiKey_(apiKey) {
     throw new Error("ยังไม่ได้ตั้งค่า API_KEY ใน Script Properties");
   }
 
-  if (!apiKey || String(apiKey) !== String(expectedApiKey)) {
+  // constant-time compare: hash ทั้งสองค่าแล้วเทียบ byte ต่อ byte
+  // ป้องกัน timing attack ที่เกิดจากการเทียบ string ตรง ๆ ด้วย !==
+  if (!apiKey || !safeEqual_(apiKey, expectedApiKey)) {
     throw new Error("API Key ไม่ถูกต้อง");
   }
+}
+
+function safeEqual_(valueA, valueB) {
+  const digestA = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(valueA),
+    Utilities.Charset.UTF_8
+  );
+
+  const digestB = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(valueB),
+    Utilities.Charset.UTF_8
+  );
+
+  if (digestA.length !== digestB.length) {
+    return false;
+  }
+
+  let difference = 0;
+
+  for (let i = 0; i < digestA.length; i += 1) {
+    difference |= digestA[i] ^ digestB[i];
+  }
+
+  return difference === 0;
 }
 
 function getProperty_(key) {
   return PropertiesService.getScriptProperties().getProperty(key);
 }
 
-function hashPassword_(password, salt) {
-  const source = String(salt) + "::" + String(password);
+const PASSWORD_ITERATIONS = 2000;
 
+function hashPassword_(password, salt, iterations) {
+  const rounds = Math.max(1, number_(iterations) || PASSWORD_ITERATIONS);
+  let digest = sha256Hex_(String(salt) + "::" + String(password));
+
+  for (let round = 1; round < rounds; round += 1) {
+    digest = sha256Hex_(digest + "::" + String(password));
+  }
+
+  return digest;
+}
+
+function sha256Hex_(source) {
   const bytes = Utilities.computeDigest(
     Utilities.DigestAlgorithm.SHA_256,
     source,
     Utilities.Charset.UTF_8
   );
 
+  return bytesToHex_(bytes);
+}
+
+function bytesToHex_(bytes) {
   return bytes
     .map(function (byte) {
       const value = byte < 0 ? byte + 256 : byte;
       return ("0" + value.toString(16)).slice(-2);
     })
     .join("");
+}
+
+// ตรวจรหัสผ่าน: ลองแบบ multi-round ก่อน แล้ว fallback เป็นแบบ legacy (SHA-256 รอบเดียว)
+// เพื่อรองรับ hash เก่าที่เก็บไว้แล้ว — login_ จะ rehash ให้เองเมื่อเจอ legacy
+function verifyPassword_(password, salt, expectedHash) {
+  const newHash = hashPassword_(password, salt);
+
+  if (safeEqual_(newHash, expectedHash)) {
+    return { ok: true, legacy: false };
+  }
+
+  const legacyHash = hashPassword_(password, salt, 1);
+
+  if (safeEqual_(legacyHash, expectedHash)) {
+    return { ok: true, legacy: true };
+  }
+
+  return { ok: false, legacy: false };
+}
+
+/* ==========================================================================
+   LOGIN RATE LIMITING (เก็บ state ใน CacheService — หมดอายุเองใน 10 นาที)
+   ========================================================================== */
+
+const MAX_LOGIN_FAILURES = 5;
+const LOGIN_LOCK_SECONDS = 600; // 10 นาที
+
+function loginFailureCacheKey_(username) {
+  return "LOGIN_FAIL_" + String(username).toLowerCase();
+}
+
+function checkLoginRateLimit_(username) {
+  const cache = CacheService.getScriptCache();
+  const fails = number_(cache.get(loginFailureCacheKey_(username)));
+
+  if (fails >= MAX_LOGIN_FAILURES) {
+    throw new Error(
+      "พยายามเข้าสู่ระบบผิดหลายครั้งเกินไป กรุณาลองใหม่อีกครั้งในอีก 10 นาที"
+    );
+  }
+}
+
+function registerLoginFailure_(username) {
+  const cache = CacheService.getScriptCache();
+  const key = loginFailureCacheKey_(username);
+  const fails = number_(cache.get(key)) + 1;
+
+  cache.put(key, String(fails), LOGIN_LOCK_SECONDS);
+}
+
+function clearLoginFailures_(username) {
+  CacheService.getScriptCache().remove(loginFailureCacheKey_(username));
 }
 
 function generateSalt_() {
@@ -2091,19 +2328,72 @@ function generateToken_() {
 }
 
 function deleteExpiredSessions_() {
+  // batch delete: เรียงแถวจากมากไปน้อยแล้วลบเป็นช่วงต่อเนื่อง (deleteRows)
+  // แทนการเรียก deleteRow() ทีละแถว — ลดจำนวน API call ลงอย่างมาก
   const now = Date.now();
+  const sheet = getSheet_("Sessions");
 
-  const expiredSessions = allObjects_("Sessions")
+  const expiredRows = allObjects_("Sessions")
     .filter(function (session) {
       return new Date(session.expiresAt).getTime() < now;
     })
+    .map(function (session) {
+      return session.__row;
+    })
     .sort(function (a, b) {
-      return b.__row - a.__row;
+      return b - a;
     });
 
-  expiredSessions.forEach(function (session) {
-    deleteRow_("Sessions", session.__row);
+  if (!expiredRows.length) {
+    return;
+  }
+
+  // รวมแถวที่ติดกันเป็นช่วง (start, length) แล้วลบทีละช่วง
+  let rangeStart = expiredRows[0];
+  let rangeLength = 1;
+
+  for (let i = 1; i <= expiredRows.length; i += 1) {
+    const row = expiredRows[i];
+
+    if (row === rangeStart - rangeLength) {
+      rangeLength += 1;
+      continue;
+    }
+
+    sheet.deleteRows(rangeStart - rangeLength + 1, rangeLength);
+
+    if (row) {
+      rangeStart = row;
+      rangeLength = 1;
+    }
+  }
+
+  invalidateObjectsCache_("Sessions");
+}
+
+/* ==========================================================================
+   DAILY MAINTENANCE (time-based trigger)
+   รันครั้งเดียว: setupDailyMaintenanceTrigger() เพื่อสร้าง trigger รายวัน
+   จากนั้นระบบจะลบ session หมดอายุทุกวันโดยอัตโนมัติ ไม่ต้องทำใน login
+   ========================================================================== */
+
+function setupDailyMaintenanceTrigger() {
+  // ลบ trigger เดิมก่อน กันสร้างซ้ำ
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === "dailyMaintenance_") {
+      ScriptApp.deleteTrigger(trigger);
+    }
   });
+
+  ScriptApp.newTrigger("dailyMaintenance_")
+    .timeBased()
+    .everyDays(1)
+    .atHour(3)
+    .create();
+}
+
+function dailyMaintenance_() {
+  deleteExpiredSessions_();
 }
 
 /* ==========================================================================

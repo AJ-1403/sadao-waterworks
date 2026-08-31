@@ -5,9 +5,28 @@ import type { Role, User } from "@/types";
 
 const COOKIE_NAME = "sadao_water_session";
 
+/*
+ * Profile cache: cache ผล getMyProfile ต่อ token สั้น ๆ (30 วินาที)
+ * เพื่อไม่ต้องยิง round-trip ไป Google Apps Script/Sheets ทุกครั้งที่ navigate
+ * ระหว่างหน้าใน portal (layout.tsx รันใหม่ทุกครั้ง)
+ * - logout จะล้าง cache ทันที (revalidate ผ่าน invalidateUserCache)
+ * - session ถูกยกเลิกที่ backend จะมีผลช้าสุด 30 วินาที (TTL) — ยอมรับได้
+ *   เพราะทุก action จริง (api/gas route) ยังส่ง token ให้ GAS verify เสมอ
+ */
+const PROFILE_CACHE_TTL_MS = 30_000;
+const profileCache = new Map<string, { user: User; cachedAt: number }>();
+
 type ProfileResponse = {
   user: User;
 };
+
+export function invalidateUserCache(token?: string) {
+  if (token) {
+    profileCache.delete(token);
+  } else {
+    profileCache.clear();
+  }
+}
 
 export async function getCurrentUser(): Promise<User | null> {
   const cookieStore = await cookies();
@@ -15,10 +34,18 @@ export async function getCurrentUser(): Promise<User | null> {
 
   if (!token) return null;
 
+  const cached = profileCache.get(token);
+
+  if (cached && Date.now() - cached.cachedAt < PROFILE_CACHE_TTL_MS) {
+    return cached.user;
+  }
+
   try {
     const profile = await callGas<ProfileResponse>("getMyProfile", { token });
+    profileCache.set(token, { user: profile.user, cachedAt: Date.now() });
     return profile.user;
   } catch {
+    profileCache.delete(token);
     return null;
   }
 }
