@@ -191,6 +191,11 @@ function doGet() {
 }
 
 function doPost(e) {
+  /* ข้อ 1.10: instrumentation วัดเวลา execution แต่ละ action (ชั่วคราวเพื่อ debug)
+     ดูผลได้ที่ Apps Script editor > Executions เขียนเป็น "GAS_TIMING" ให้ grep ง่าย */
+  const startedAt = Date.now();
+  let actionLabel = "unknown";
+
   try {
     if (!e || !e.postData || !e.postData.contents) {
       throw new Error("ไม่พบข้อมูลคำขอ");
@@ -204,6 +209,8 @@ function doPost(e) {
       throw new Error("กรุณาระบุ action");
     }
 
+    actionLabel = String(request.action);
+
     const data = dispatchAction_(request);
 
     return jsonResponse_({
@@ -215,6 +222,14 @@ function doPost(e) {
       success: false,
       error: error && error.message ? error.message : "เกิดข้อผิดพลาดในระบบ",
     });
+  } finally {
+    // รันทั้ง success/error เพื่อเทียบเวลาก่อน-หลัง optimize ได้เสมอ
+    console.log(
+      "GAS_TIMING action=" +
+        actionLabel +
+        " elapsedMs=" +
+        (Date.now() - startedAt)
+    );
   }
 }
 
@@ -1267,7 +1282,11 @@ function calculateWaterCharge_(unitsUsed, billingDate) {
   const rates = getActiveRates_(billingDate);
 
   if (!rates.length) {
-    throw new Error("ไม่พบเรทค่าน้ำ กรุณาตั้งค่าเรทค่าน้ำก่อนออกบิล");
+    // fix: ข้อความ error ที่ชัดขึ้น — บอกว่าต้องไปตั้งที่ไหน (เกิดเมื่อ WaterRates ว่างเปล่าเท่านั้น
+    // เพราะถ้ามีเรทแม้วันเริ่มใช้อยู่ในอนาคต getActiveRates_ จะ fallback ให้แล้ว)
+    throw new Error(
+      "ไม่พบเรทค่าน้ำในระบบ กรุณาไปที่เมนู 'ตั้งค่าระบบ' > 'เรทค่าน้ำและภาษี' เพื่อบันทึกเรทก่อนออกบิล"
+    );
   }
 
   const rateMode = String(rates[0].rateMode || "flat");
@@ -1813,7 +1832,29 @@ function getActiveRates_(billingDate) {
     return isActive_(rate.active) && dateKey_(rate.effectiveDate) <= targetDate;
   });
 
+  /* fix: ถ้าไม่มีเรทที่ "วันเริ่มใช้ <= วันที่ 1 ของรอบบิล" แต่ยังมีเรท active อยู่
+     ให้ fallback ไปใช้เรท active ที่เก่าที่สุดแทนการ throw
+     เหตุผล: กรณีที่พบจริงคือ admin ตั้งเรทด้วยวันที่เริ่มใช้ = วันปัจจุบัน
+     แต่ออกบิลรอบย้อนหลัง (billingPeriod ก่อนหน้า) เดิมระบบจะ throw
+     "ไม่พบเรทค่าน้ำ กรุณาตั้งค่าเรทค่าน้ำก่อนออกบิล" ทั้งที่เรทมีอยู่จริง
+     — หมู่บ้านขนาดเล็กใช้ราคาชุดเดียว การใช้เรทเก่าสุดปลอดภัยกว่าทำให้ออกบิลไม่ได้ */
   if (!validRates.length) {
+    const anyActiveRates = allObjects_("WaterRates").filter(function (rate) {
+      return isActive_(rate.active);
+    });
+
+    if (anyActiveRates.length) {
+      const earliestDate = anyActiveRates
+        .map(function (rate) {
+          return dateKey_(rate.effectiveDate);
+        })
+        .sort()[0];
+
+      return anyActiveRates.filter(function (rate) {
+        return dateKey_(rate.effectiveDate) === earliestDate;
+      });
+    }
+
     return [];
   }
 
