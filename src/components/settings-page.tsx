@@ -39,7 +39,8 @@ export function SettingsPage() {
 
   async function saveBank(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
+    const form = new FormData(formElement);
 
     await api("saveBankAccount", {
       bankName: form.get("bankName"),
@@ -49,7 +50,7 @@ export function SettingsPage() {
     });
 
     setMessage("เพิ่มข้อมูลบัญชีธนาคารเรียบร้อย");
-    event.currentTarget.reset();
+    formElement.reset();
     await loadSettings();
   }
 

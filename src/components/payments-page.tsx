@@ -62,7 +62,8 @@ export function PaymentsPage() {
 
   async function recordPayment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
+    const form = new FormData(formElement);
 
     try {
       await api("recordPayment", {
@@ -73,7 +74,7 @@ export function PaymentsPage() {
       });
 
       setOpen(false);
-      event.currentTarget.reset();
+      formElement.reset();
       await loadData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "บันทึกการชำระเงินไม่สำเร็จ");

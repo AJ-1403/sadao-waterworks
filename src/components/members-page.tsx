@@ -67,7 +67,8 @@ export function MembersPage() {
 
   async function createMember(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await (React ทำ currentTarget เป็น null หลัง async)
+    const form = new FormData(formElement);
 
     try {
       await api("createMember", {
@@ -79,7 +80,7 @@ export function MembersPage() {
         password: form.get("password"),
       });
 
-      event.currentTarget.reset();
+      formElement.reset();
       setCreateOpen(false);
       await loadMembers();
     } catch (error) {

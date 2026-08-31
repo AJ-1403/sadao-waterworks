@@ -30,7 +30,8 @@ export function StaffPage() {
 
   async function createStaff(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
+    const form = new FormData(formElement);
 
     try {
       await api("createStaff", {
@@ -42,7 +43,7 @@ export function StaffPage() {
       });
 
       setOpen(false);
-      event.currentTarget.reset();
+      formElement.reset();
       await loadStaff();
     } catch (error) {
       setError(error instanceof Error ? error.message : "เพิ่มพนักงานไม่สำเร็จ");

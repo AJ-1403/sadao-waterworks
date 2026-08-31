@@ -49,7 +49,8 @@ export function BillsPage() {
 
   async function createBill(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
+    const form = new FormData(formElement);
 
     try {
       await api("createBill", {
@@ -61,7 +62,7 @@ export function BillsPage() {
       });
 
       setOpen(false);
-      event.currentTarget.reset();
+      formElement.reset();
       await loadData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "ออกบิลไม่สำเร็จ");
