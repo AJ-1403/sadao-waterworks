@@ -28,6 +28,21 @@ export function BillsPage() {
   const [members, setMembers] = useState<Member[]>([]);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
+  // ข้อ 2.3: ป้องกันกดปุ่มซ้ำระหว่างรอ response
+  const [submitting, setSubmitting] = useState(false);
+  // ข้อ 2.2: idempotency key ต่อ 1 รอบการเปิดฟอร์ม (ไม่ generate ใหม่ทุก re-render)
+  const [idempotencyKey, setIdempotencyKey] = useState(() =>
+    crypto.randomUUID()
+  );
+
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    // ข้อ 2.2: generate UUID ใหม่ทุกครั้งที่ "เปิด" ฟอร์ม
+    // (ฟอร์มรอบก่อนอาจ submit ไปแล้ว — key เดิมต้องไม่ถูกใช้ซ้ำ)
+    if (nextOpen) {
+      setIdempotencyKey(crypto.randomUUID());
+    }
+  }
 
   async function loadData() {
     try {
@@ -52,6 +67,11 @@ export function BillsPage() {
     const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
     const form = new FormData(formElement);
 
+    // ข้อ 2.3: กัน double-submit — ถ้ากำลังรอ response อยู่ให้ข้ามทันที
+    if (submitting) return;
+
+    setSubmitting(true);
+
     try {
       await api("createBill", {
         memberId: form.get("memberId"),
@@ -59,6 +79,8 @@ export function BillsPage() {
         currentMeter: Number(form.get("currentMeter")),
         dueDate: form.get("dueDate"),
         note: form.get("note"),
+        // ข้อ 2.2: แนบ idempotencyKey — backend ใช้กันการออกบิลซ้ำ
+        idempotencyKey,
       });
 
       setOpen(false);
@@ -66,6 +88,9 @@ export function BillsPage() {
       await loadData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "ออกบิลไม่สำเร็จ");
+    } finally {
+      // ข้อ 2.3: ปลดล็อกปุ่มเสมอ ไม่ว่าสำเร็จหรือ error
+      setSubmitting(false);
     }
   }
 
@@ -82,7 +107,7 @@ export function BillsPage() {
         </div>
 
         {user.role !== "member" && (
-          <Dialog open={open} onOpenChange={setOpen}>
+          <Dialog open={open} onOpenChange={handleOpenChange}>
             <DialogTrigger asChild>
               <Button className="bg-teal-600 hover:bg-teal-700">
                 <Plus className="mr-2 h-4 w-4" />
@@ -137,8 +162,13 @@ export function BillsPage() {
                   <Textarea name="note" placeholder="ถ้ามี" />
                 </div>
 
-                <Button type="submit" className="w-full bg-teal-600 hover:bg-teal-700">
-                  ยืนยันการออกบิล
+                <Button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-full bg-teal-600 hover:bg-teal-700"
+                >
+                  {/* ข้อ 2.3: disable + loading indicator ระหว่างรอ response */}
+                  {submitting ? "กำลังบันทึก..." : "ยืนยันการออกบิล"}
                 </Button>
               </form>
             </DialogContent>

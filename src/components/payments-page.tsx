@@ -22,6 +22,8 @@ export function PaymentsPage() {
   const [unpaidBills, setUnpaidBills] = useState<Bill[]>([]);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
+  // ข้อ 2.3: ป้องกันกดปุ่มซ้ำระหว่างรอ response
+  const [submitting, setSubmitting] = useState(false);
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const receiptRef = useRef<HTMLDivElement>(null);
 
@@ -65,6 +67,11 @@ export function PaymentsPage() {
     const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
     const form = new FormData(formElement);
 
+    // ข้อ 2.3: กัน double-submit — ถ้ากำลังรอ response อยู่ให้ข้ามทันที
+    if (submitting) return;
+
+    setSubmitting(true);
+
     try {
       await api("recordPayment", {
         billId: form.get("billId"),
@@ -78,6 +85,9 @@ export function PaymentsPage() {
       await loadData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "บันทึกการชำระเงินไม่สำเร็จ");
+    } finally {
+      // ข้อ 2.3: ปลดล็อกปุ่มเสมอ ไม่ว่าสำเร็จหรือ error
+      setSubmitting(false);
     }
   }
 
@@ -147,8 +157,13 @@ export function PaymentsPage() {
                   <Textarea name="paymentNote" placeholder="เช่น เลขอ้างอิงการโอน" />
                 </div>
 
-                <Button type="submit" className="w-full bg-teal-600 hover:bg-teal-700">
-                  บันทึกการชำระเงิน
+                <Button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-full bg-teal-600 hover:bg-teal-700"
+                >
+                  {/* ข้อ 2.3: disable + loading indicator ระหว่างรอ response */}
+                  {submitting ? "กำลังบันทึก..." : "บันทึกการชำระเงิน"}
                 </Button>
               </form>
             </DialogContent>

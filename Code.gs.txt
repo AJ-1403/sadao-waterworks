@@ -1105,6 +1105,25 @@ function addBillDisplayFields_(bill) {
 }
 
 function createBill_(context, request) {
+  /* ข้อ 1.7 ชั้นที่ 1 — Idempotency key:
+     เช็ค cache ก่อนเข้า withLock_ (นอก lock) เพื่อลด lock contention
+     ถ้า request ซ้ำ (เช่น double-click / retry หลัง timeout) ให้คืนผลลัพธ์เดิมทันที */
+  const idempotencyKey = String(request.idempotencyKey || "").trim();
+
+  if (idempotencyKey) {
+    try {
+      const cachedResult = CacheService.getScriptCache().get(
+        "idem_" + idempotencyKey
+      );
+
+      if (cachedResult) {
+        return JSON.parse(cachedResult);
+      }
+    } catch (error) {
+      // cache ล้มเหลว → ไปทำ duplicate check ชั้นที่ 2 ตามปกติ (ยังปลอดภัย)
+    }
+  }
+
   return withLock_(function () {
     const memberId = String(request.memberId || "").trim();
     const billingPeriod = String(request.billingPeriod || "").trim();
@@ -1141,7 +1160,17 @@ function createBill_(context, request) {
     });
 
     if (duplicateBill) {
-      throw new Error("ลูกบ้านรายนี้มีบิลในรอบ " + billingPeriod + " แล้ว");
+      // ข้อ 1.7 ชั้นที่ 2: duplicate check อ่านจาก allObjects_("Bills") สด
+      // (Bills ไม่ถูก CacheService cache ตามข้อ 1.2) และอยู่ใน withLock_
+      // เพื่อกัน race condition ของ 2 request ที่ยิงพร้อมกัน
+      // บอกเลขบิลเดิม (billNo) ให้ผู้ใช้รู้ว่าทำไมออกบิลซ้ำไม่ได้
+      throw new Error(
+        "ลูกบ้านรายนี้มีบิลในรอบ " +
+          billingPeriod +
+          " แล้ว (เลขบิลเดิม: " +
+          duplicateBill.billNo +
+          ") จึงออกบิลซ้ำไม่ได้ หากต้องการแก้ไขกรุณายกเลิกบิลเดิมก่อน"
+      );
     }
 
     const latestBill = bills
@@ -1201,7 +1230,7 @@ function createBill_(context, request) {
       "ออกบิล " + billNo + " บ้านเลขที่ " + member.houseNo
     );
 
-    return {
+    const result = {
       billId: billId,
       billNo: billNo,
       previousMeter: previousMeter,
@@ -1213,6 +1242,24 @@ function createBill_(context, request) {
       totalAmount: charge.totalAmount,
       message: "ออกบิลค่าน้ำเรียบร้อย",
     };
+
+    /* ข้อ 1.7: เก็บผลลัพธ์ลง cache "ข้างใน" withLock_ หลังสร้างบิลสำเร็จ
+       เพื่อไม่ให้ 2 request ที่ idempotencyKey ต่างกันแต่
+       memberId+billingPeriod เดียวกัน race กันตอน cache ยังว่าง
+       (ชั้นที่ 2 duplicate check ใน lock เป็นตัวกันสุดท้ายอยู่แล้ว) */
+    if (idempotencyKey) {
+      try {
+        CacheService.getScriptCache().put(
+          "idem_" + idempotencyKey,
+          JSON.stringify(result),
+          120 // TTL 120 วินาที ตามสเปค
+        );
+      } catch (error) {
+        // cache ล้มเหลว → ยังมี duplicate check ชั้นที่ 2 คุ้มกันอยู่
+      }
+    }
+
+    return result;
   });
 }
 
@@ -1867,8 +1914,46 @@ let spreadsheetCache_ = null;
 const sheetCache_ = {};
 const objectsCache_ = {};
 
+/* ข้อ 1.2: ตารางที่เปลี่ยนไม่บ่อย ใช้ CacheService (cross-execution) ได้
+   ส่วน Bills / Payments / Sessions / AuditLogs ห้าม cache เพราะต้องเป็น
+   ข้อมูล real-time เพื่อความถูกต้องทางบัญชีและกันการออกบิลซ้ำ */
+const CACHEABLE_SHEETS = [
+  "Members",
+  "Staff",
+  "Settings",
+  "WaterRates",
+  "BankAccounts",
+  "Users",
+];
+const SHEET_CACHE_TTL_SECONDS = 300; // 5 นาที
+
+function isCacheableSheet_(sheetName) {
+  return CACHEABLE_SHEETS.indexOf(sheetName) !== -1;
+}
+
+function sheetCacheKey_(sheetName) {
+  return "tbl_" + sheetName;
+}
+
+/* ข้อ 1.2: ล้าง cache ของตาราง (เรียกจาก append/update/delete ผ่าน
+   invalidateObjectsCache_ เสมอ จึงไม่มี stale cache หลังการเขียนข้อมูล) */
+function invalidateCache_(sheetName) {
+  if (isCacheableSheet_(sheetName)) {
+    try {
+      CacheService.getScriptCache().remove(sheetCacheKey_(sheetName));
+    } catch (error) {
+      // ถ้า CacheService ล้มเหลว ให้ข้ามได้ — ข้อมูลยังถูกต้องจากตัว Sheet เอง
+    }
+  }
+}
+
 function invalidateObjectsCache_(sheetName) {
+  // ข้อ 1.3: ล้าง memo ระดับ execution ทันทีหลัง append/update/delete
+  // เพื่อให้การอ่านครั้งถัดไปใน execution เดียวกันเห็นข้อมูลล่าสุดเสมอ
+  // (สำคัญกับ Bills เช่น createBill_ ต้องเห็นบิลที่ตัวเองเพิ่งสร้าง)
   delete objectsCache_[sheetName];
+  // ข้อ 1.2: ล้าง CacheService ข้าม execution ด้วย เพื่อไม่ให้ข้อมูลค้าง
+  invalidateCache_(sheetName);
 }
 
 function getSpreadsheet_() {
@@ -1976,28 +2061,59 @@ function allObjects_(sheetName, options) {
   // memoization ต่อ 1 execution: ถ้าอ่านชีตเดิมไปแล้วให้ใช้ค่าที่อ่านไว้
   // (คืนเป็น shallow copy เสมอ เพื่อกัน caller แก้ข้อมูลใน cache)
   if (!objectsCache_[sheetName]) {
-    const sheet = getSheet_(sheetName);
-    const headers = SCHEMAS[sheetName];
-    const lastRow = sheet.getLastRow();
+    // ข้อ 1.2: ก่อนยิง Sheets API ลองดึงจาก CacheService ก่อน
+    // (เฉพาะตารางที่เปลี่ยนไม่บ่อย — Bills/Payments ฯลฯ ไม่ผ่าน path นี้)
+    if (isCacheableSheet_(sheetName)) {
+      try {
+        const cachedJson = CacheService.getScriptCache().get(
+          sheetCacheKey_(sheetName)
+        );
 
-    if (lastRow < 2) {
-      objectsCache_[sheetName] = [];
-    } else {
-      const values = sheet
-        .getRange(2, 1, lastRow - 1, headers.length)
-        .getValues();
+        if (cachedJson) {
+          objectsCache_[sheetName] = JSON.parse(cachedJson);
+        }
+      } catch (error) {
+        // cache พัง/หมดอายุกลางคัน → อ่านจาก Sheet ตามปกติ
+      }
+    }
 
-      objectsCache_[sheetName] = values.map(function (row, index) {
-        const item = {
-          __row: index + 2,
-        };
+    if (!objectsCache_[sheetName]) {
+      const sheet = getSheet_(sheetName);
+      const headers = SCHEMAS[sheetName];
+      const lastRow = sheet.getLastRow();
 
-        headers.forEach(function (header, columnIndex) {
-          item[header] = normalizeCell_(header, row[columnIndex]);
+      if (lastRow < 2) {
+        objectsCache_[sheetName] = [];
+      } else {
+        const values = sheet
+          .getRange(2, 1, lastRow - 1, headers.length)
+          .getValues();
+
+        objectsCache_[sheetName] = values.map(function (row, index) {
+          const item = {
+            __row: index + 2,
+          };
+
+          headers.forEach(function (header, columnIndex) {
+            item[header] = normalizeCell_(header, row[columnIndex]);
+          });
+
+          return item;
         });
+      }
 
-        return item;
-      });
+      // ข้อ 1.2: write-through cache ด้วย TTL 300 วินาที
+      if (isCacheableSheet_(sheetName)) {
+        try {
+          CacheService.getScriptCache().put(
+            sheetCacheKey_(sheetName),
+            JSON.stringify(objectsCache_[sheetName]),
+            SHEET_CACHE_TTL_SECONDS
+          );
+        } catch (error) {
+          // เกินขนาด cache (100KB/ค่า) หรือ quota → ไม่ cache แล้วอ่านสดต่อไป
+        }
+      }
     }
   }
 
@@ -2282,11 +2398,12 @@ function verifyPassword_(password, salt, expectedHash) {
 }
 
 /* ==========================================================================
-   LOGIN RATE LIMITING (เก็บ state ใน CacheService — หมดอายุเองใน 10 นาที)
+   LOGIN RATE LIMITING (เก็บ state ใน CacheService — หมดอายุเองใน 15 นาที)
    ========================================================================== */
 
+// ข้อ 1.8: ล็อก login ชั่วคราวถ้าผิดเกิน 5 ครั้งภายใน 15 นาที
 const MAX_LOGIN_FAILURES = 5;
-const LOGIN_LOCK_SECONDS = 600; // 10 นาที
+const LOGIN_LOCK_SECONDS = 900; // 15 นาที
 
 function loginFailureCacheKey_(username) {
   return "LOGIN_FAIL_" + String(username).toLowerCase();
@@ -2297,8 +2414,9 @@ function checkLoginRateLimit_(username) {
   const fails = number_(cache.get(loginFailureCacheKey_(username)));
 
   if (fails >= MAX_LOGIN_FAILURES) {
+    // ข้อ 1.8: แจ้งเวลาที่ต้องรอให้ชัดเจน
     throw new Error(
-      "พยายามเข้าสู่ระบบผิดหลายครั้งเกินไป กรุณาลองใหม่อีกครั้งในอีก 10 นาที"
+      "พยายามเข้าสู่ระบบผิดหลายครั้งเกินไป บัญชีนี้ถูกล็อกชั่วคราว กรุณาลองใหม่อีกครั้งในอีก 15 นาที"
     );
   }
 }
