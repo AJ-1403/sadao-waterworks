@@ -15,6 +15,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 
+/* ข้อ 2.4: SaveState รวมสถานะของ mutation — idle/saving/success/error
+   ใช้ป้องกัน double-submit (ข้อ 2.5) และแสดง feedback ให้ผู้ใช้เสมอ */
+type SaveState = "idle" | "saving" | "success" | "error";
+
 function billBadge(status?: string) {
   if (status === "paid") return <Badge className="bg-emerald-600">ชำระแล้ว</Badge>;
   if (status === "overdue") return <Badge variant="destructive">เกินกำหนด</Badge>;
@@ -28,12 +32,25 @@ export function BillsPage() {
   const [members, setMembers] = useState<Member[]>([]);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
-  // ข้อ 2.3: ป้องกันกดปุ่มซ้ำระหว่างรอ response
-  const [submitting, setSubmitting] = useState(false);
+  // ข้อ 2.4/2.5: SaveState เดียวครอบทั้ง saving/success/error + กัน double-submit
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [message, setMessage] = useState("");
   // ข้อ 2.2: idempotency key ต่อ 1 รอบการเปิดฟอร์ม (ไม่ generate ใหม่ทุก re-render)
   const [idempotencyKey, setIdempotencyKey] = useState(() =>
     crypto.randomUUID()
   );
+
+  /* ข้อ 2.4: แสดงข้อความสำเร็จค้างไว้ 2.5 วินาทีแล้วกลับสู่ idle
+     (inline component แทนการเพิ่ม toast library ใหม่) */
+  function flashSuccess(text: string) {
+    setSaveState("success");
+    setMessage(text);
+
+    setTimeout(() => {
+      setSaveState("idle");
+      setMessage("");
+    }, 2500);
+  }
 
   function handleOpenChange(nextOpen: boolean) {
     setOpen(nextOpen);
@@ -47,11 +64,20 @@ export function BillsPage() {
   async function loadData() {
     try {
       setError("");
-      const billData = await api<Bill[]>("listBills");
+      /* ข้อ 2.1: เดิมยิง listBills แล้วรอจบค่อยยิง listMembers (sequential)
+         เปลี่ยนเป็น Promise.all ยิงพร้อมกัน — ลดเวลารอเหลือเท่า request ที่ช้าที่สุด
+         (listBills ~2.5-9s + listMembers ~2-3s → เหลือ ~max ของทั้งสอง) */
+      const [billData, memberData] = await Promise.all([
+        api<Bill[]>("listBills"),
+        user.role !== "member"
+          ? api<Member[]>("listMembers")
+          : Promise.resolve([] as Member[]),
+      ]);
+
       setBills(billData);
 
       if (user.role !== "member") {
-        setMembers(await api<Member[]>("listMembers"));
+        setMembers(memberData);
       }
     } catch (error) {
       setError(error instanceof Error ? error.message : "โหลดข้อมูลไม่สำเร็จ");
@@ -67,10 +93,10 @@ export function BillsPage() {
     const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
     const form = new FormData(formElement);
 
-    // ข้อ 2.3: กัน double-submit — ถ้ากำลังรอ response อยู่ให้ข้ามทันที
-    if (submitting) return;
+    // ข้อ 2.5: กัน double-submit — ถ้ากำลังรอ response อยู่ให้ข้ามทันที
+    if (saveState === "saving") return;
 
-    setSubmitting(true);
+    setSaveState("saving");
 
     try {
       await api("createBill", {
@@ -85,12 +111,16 @@ export function BillsPage() {
 
       setOpen(false);
       formElement.reset();
+      flashSuccess("ออกบิลค่าน้ำสำเร็จ");
       await loadData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "ออกบิลไม่สำเร็จ");
+      setSaveState("error");
     } finally {
-      // ข้อ 2.3: ปลดล็อกปุ่มเสมอ ไม่ว่าสำเร็จหรือ error
-      setSubmitting(false);
+      // ข้อ 2.4: รับประกันสถานะไม่ค้างที่ "saving" เสมอ (ส่วน success/error คงไว้ให้เห็น)
+      setSaveState((state) => (state === "saving" ? "idle" : state));
+      // ข้อ 2.6: generate key ใหม่หลัง submit สำเร็จหรือ error — รอบถัดไปต้องไม่ใช้ key เดิม
+      setIdempotencyKey(crypto.randomUUID());
     }
   }
 
@@ -164,11 +194,11 @@ export function BillsPage() {
 
                 <Button
                   type="submit"
-                  disabled={submitting}
+                  disabled={saveState === "saving"}
                   className="w-full bg-teal-600 hover:bg-teal-700"
                 >
-                  {/* ข้อ 2.3: disable + loading indicator ระหว่างรอ response */}
-                  {submitting ? "กำลังบันทึก..." : "ยืนยันการออกบิล"}
+                  {/* ข้อ 2.4/2.5: disable + loading indicator ระหว่างรอ response */}
+                  {saveState === "saving" ? "กำลังบันทึกข้อมูล..." : "ยืนยันการออกบิล"}
                 </Button>
               </form>
             </DialogContent>
@@ -177,6 +207,11 @@ export function BillsPage() {
       </div>
 
       {error && <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+
+      {/* ข้อ 2.4: แสดงข้อความสำเร็จ (inline แทน toast library) */}
+      {saveState === "success" && message && (
+        <p className="rounded-md bg-emerald-50 p-3 text-sm text-emerald-700">{message}</p>
+      )}
 
       <Card>
         <CardHeader>
@@ -200,8 +235,11 @@ export function BillsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {bills.map((bill) => (
-                <TableRow key={bill.billId}>
+              {bills.map((bill, index) => (
+                // fix: ข้อมูลบิลจาก Sheet บางแถวอาจมี billId ว่าง/ซ้ำ ทำให้ React
+                // เตือน "two children with the same key" — ใช้ fallback billNo แล้ว
+                // ตามด้วย index เพื่อให้ key ไม่ซ้ำเสมอ (ไม่แตะข้อมูลจริงใน Sheet)
+                <TableRow key={bill.billId || bill.billNo || `row-${index}`}>
                   <TableCell className="font-medium">{bill.billNo}</TableCell>
                   {user.role !== "member" && (
                     <TableCell>

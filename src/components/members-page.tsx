@@ -30,14 +30,31 @@ function isActive(value: boolean | string) {
   return value === true || value === "true" || value === "TRUE";
 }
 
+/* ข้อ 2.4: SaveState รวมสถานะของ mutation — idle/saving/success/error */
+type SaveState = "idle" | "saving" | "success" | "error";
+
 export function MembersPage() {
   const user = useUser();
   const [members, setMembers] = useState<Member[]>([]);
   const [selectedMember, setSelectedMember] = useState<Member | null>(null);
   const [search, setSearch] = useState("");
   const [error, setError] = useState("");
+  // ข้อ ใช้ state เดียวร่วมกันทุกฟอร์ม/ปุ่มในหน้านี้ (createMember, updateMember, toggleMemberStatus)
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [message, setMessage] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+
+  /* ข้อ 2.4: แสดงข้อความสำเร็จค้างไว้ 2.5 วินาทีแล้วกลับสู่ idle */
+  function flashSuccess(text: string) {
+    setSaveState("success");
+    setMessage(text);
+
+    setTimeout(() => {
+      setSaveState("idle");
+      setMessage("");
+    }, 2500);
+  }
 
   async function loadMembers() {
     try {
@@ -70,6 +87,11 @@ export function MembersPage() {
     const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await (React ทำ currentTarget เป็น null หลัง async)
     const form = new FormData(formElement);
 
+    // ข้อ 2.5: กัน double-submit
+    if (saveState === "saving") return;
+
+    setSaveState("saving");
+
     try {
       await api("createMember", {
         houseNo: form.get("houseNo"),
@@ -82,18 +104,24 @@ export function MembersPage() {
 
       formElement.reset();
       setCreateOpen(false);
+      flashSuccess("เพิ่มข้อมูลลูกบ้านสำเร็จ");
       await loadMembers();
     } catch (error) {
       setError(error instanceof Error ? error.message : "เพิ่มลูกบ้านไม่สำเร็จ");
+      setSaveState("error");
+    } finally {
+      setSaveState((state) => (state === "saving" ? "idle" : state));
     }
   }
 
   async function updateMember(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!selectedMember) return;
+    if (!selectedMember || saveState === "saving") return;
 
     const form = new FormData(event.currentTarget);
+
+    setSaveState("saving");
 
     try {
       await api("updateMember", {
@@ -108,9 +136,13 @@ export function MembersPage() {
 
       setEditOpen(false);
       setSelectedMember(null);
+      flashSuccess("บันทึกข้อมูลลูกบ้านสำเร็จ");
       await loadMembers();
     } catch (error) {
       setError(error instanceof Error ? error.message : "แก้ไขข้อมูลไม่สำเร็จ");
+      setSaveState("error");
+    } finally {
+      setSaveState((state) => (state === "saving" ? "idle" : state));
     }
   }
 
@@ -122,7 +154,9 @@ export function MembersPage() {
         : `ต้องการเปิดใช้งานบ้านเลขที่ ${member.houseNo} ใช่หรือไม่?`
     );
 
-    if (!confirmed) return;
+    if (!confirmed || saveState === "saving") return;
+
+    setSaveState("saving");
 
     try {
       await api("toggleMemberStatus", {
@@ -130,9 +164,13 @@ export function MembersPage() {
         active: !active,
       });
 
+      flashSuccess("เปลี่ยนสถานะลูกบ้านสำเร็จ");
       await loadMembers();
     } catch (error) {
       setError(error instanceof Error ? error.message : "เปลี่ยนสถานะไม่สำเร็จ");
+      setSaveState("error");
+    } finally {
+      setSaveState((state) => (state === "saving" ? "idle" : state));
     }
   }
 
@@ -203,9 +241,11 @@ export function MembersPage() {
                   </div>
                   <Button
                     type="submit"
+                    disabled={saveState === "saving"}
                     className="w-full bg-teal-600 hover:bg-teal-700"
                   >
-                    บันทึกข้อมูล
+                    {/* ข้อ 2.4/2.5: disable ระหว่าง saving กัน double-submit */}
+                    {saveState === "saving" ? "กำลังบันทึกข้อมูล..." : "บันทึกข้อมูล"}
                   </Button>
                 </form>
               </DialogContent>
@@ -217,6 +257,13 @@ export function MembersPage() {
       {error && (
         <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">
           {error}
+        </p>
+      )}
+
+      {/* ข้อ 2.4: แสดงข้อความสำเร็จ (inline แทน toast library) */}
+      {saveState === "success" && message && (
+        <p className="rounded-md bg-emerald-50 p-3 text-sm text-emerald-700">
+          {message}
         </p>
       )}
 
@@ -253,11 +300,11 @@ export function MembersPage() {
             </TableHeader>
 
             <TableBody>
-              {filteredMembers.map((member) => {
+              {filteredMembers.map((member, index) => {
                 const active = isActive(member.active);
 
                 return (
-                  <TableRow key={member.memberId}>
+                  <TableRow key={member.memberId || `row-${index}`}>
                     <TableCell className="font-medium">
                       {member.houseNo}
                     </TableCell>
@@ -286,6 +333,7 @@ export function MembersPage() {
                           <Button
                             variant={active ? "destructive" : "secondary"}
                             size="sm"
+                            disabled={saveState === "saving"}
                             onClick={() => toggleStatus(member)}
                           >
                             <Power className="mr-1 h-4 w-4" />
@@ -366,9 +414,10 @@ export function MembersPage() {
               </div>
               <Button
                 type="submit"
+                disabled={saveState === "saving"}
                 className="w-full bg-teal-600 hover:bg-teal-700"
               >
-                บันทึกการแก้ไข
+                {saveState === "saving" ? "กำลังบันทึกข้อมูล..." : "บันทึกการแก้ไข"}
               </Button>
             </form>
           )}

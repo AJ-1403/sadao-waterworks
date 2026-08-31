@@ -16,16 +16,31 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 
+/* ข้อ 2.4: SaveState รวมสถานะของ mutation — idle/saving/success/error */
+type SaveState = "idle" | "saving" | "success" | "error";
+
 export function PaymentsPage() {
   const user = useUser();
   const [payments, setPayments] = useState<Payment[]>([]);
   const [unpaidBills, setUnpaidBills] = useState<Bill[]>([]);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
-  // ข้อ 2.3: ป้องกันกดปุ่มซ้ำระหว่างรอ response
-  const [submitting, setSubmitting] = useState(false);
+  // ข้อ 2.4/2.5: SaveState เดียวครอบ saving/success/error + กัน double-submit
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [message, setMessage] = useState("");
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const receiptRef = useRef<HTMLDivElement>(null);
+
+  /* ข้อ 2.4: แสดงข้อความสำเร็จค้างไว้ 2.5 วินาทีแล้วกลับสู่ idle */
+  function flashSuccess(text: string) {
+    setSaveState("success");
+    setMessage(text);
+
+    setTimeout(() => {
+      setSaveState("idle");
+      setMessage("");
+    }, 2500);
+  }
 
   const handlePrint = useReactToPrint({
     contentRef: receiptRef,
@@ -48,10 +63,19 @@ export function PaymentsPage() {
 
   async function loadData() {
     try {
-      setPayments(await api<Payment[]>("listPayments"));
+      /* ข้อ 2.1: เดิมยิง listPayments แล้วรอจบค่อยยิง listBills (sequential)
+         เปลี่ยนเป็น Promise.all ยิงพร้อมกัน — ลดเวลารอเหลือเท่า request ที่ช้าที่สุด */
+      const [paymentData, unpaidData] = await Promise.all([
+        api<Payment[]>("listPayments"),
+        user.role !== "member"
+          ? api<Bill[]>("listBills", { status: "unpaid" })
+          : Promise.resolve([] as Bill[]),
+      ]);
+
+      setPayments(paymentData);
 
       if (user.role !== "member") {
-        setUnpaidBills(await api<Bill[]>("listBills", { status: "unpaid" }));
+        setUnpaidBills(unpaidData);
       }
     } catch (error) {
       setError(error instanceof Error ? error.message : "โหลดข้อมูลไม่สำเร็จ");
@@ -67,10 +91,10 @@ export function PaymentsPage() {
     const formElement = event.currentTarget; // เก็บ ref ไว้ก่อน await
     const form = new FormData(formElement);
 
-    // ข้อ 2.3: กัน double-submit — ถ้ากำลังรอ response อยู่ให้ข้ามทันที
-    if (submitting) return;
+    // ข้อ 2.5: กัน double-submit — ถ้ากำลังรอ response อยู่ให้ข้ามทันที
+    if (saveState === "saving") return;
 
-    setSubmitting(true);
+    setSaveState("saving");
 
     try {
       await api("recordPayment", {
@@ -82,12 +106,14 @@ export function PaymentsPage() {
 
       setOpen(false);
       formElement.reset();
+      flashSuccess("บันทึกการชำระเงินสำเร็จ");
       await loadData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "บันทึกการชำระเงินไม่สำเร็จ");
+      setSaveState("error");
     } finally {
-      // ข้อ 2.3: ปลดล็อกปุ่มเสมอ ไม่ว่าสำเร็จหรือ error
-      setSubmitting(false);
+      // ข้อ 2.4: รับประกันสถานะไม่ค้างที่ "saving" เสมอ
+      setSaveState((state) => (state === "saving" ? "idle" : state));
     }
   }
 
@@ -159,11 +185,11 @@ export function PaymentsPage() {
 
                 <Button
                   type="submit"
-                  disabled={submitting}
+                  disabled={saveState === "saving"}
                   className="w-full bg-teal-600 hover:bg-teal-700"
                 >
-                  {/* ข้อ 2.3: disable + loading indicator ระหว่างรอ response */}
-                  {submitting ? "กำลังบันทึก..." : "บันทึกการชำระเงิน"}
+                  {/* ข้อ 2.4/2.5: disable + loading indicator ระหว่างรอ response */}
+                  {saveState === "saving" ? "กำลังบันทึกข้อมูล..." : "บันทึกการชำระเงิน"}
                 </Button>
               </form>
             </DialogContent>
@@ -172,6 +198,11 @@ export function PaymentsPage() {
       </div>
 
       {error && <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+
+      {/* ข้อ 2.4: แสดงข้อความสำเร็จ (inline แทน toast library) */}
+      {saveState === "success" && message && (
+        <p className="rounded-md bg-emerald-50 p-3 text-sm text-emerald-700">{message}</p>
+      )}
 
       <Card>
         <CardHeader>
@@ -196,8 +227,9 @@ export function PaymentsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {payments.map((payment) => (
-                <TableRow key={payment.paymentId}>
+              {payments.map((payment, index) => (
+                // fix: กัน key ซ้ำถ้าข้อมูลจาก Sheet มี paymentId ว่าง/ซ้ำ (เหมือน bills-page)
+                <TableRow key={payment.paymentId || payment.paymentNo || `row-${index}`}>
                   <TableCell>{payment.paymentNo}</TableCell>
                   <TableCell>{payment.billNo}</TableCell>
                   <TableCell>{payment.houseNo}</TableCell>
