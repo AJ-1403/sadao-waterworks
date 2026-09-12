@@ -16,6 +16,8 @@ export type Member = {
     phone: string;
     address: string;
     initialMeter: number;
+    // ส่วนที่ 6.2: เลขมิเตอร์ครั้งก่อน (จากบิลล่าสุดที่ไม่ cancelled, fallback = initialMeter)
+    lastMeterReading: number;
     active: boolean | string;
 };
 
@@ -26,6 +28,8 @@ export type Staff = {
     position: string;
     phone: string;
     active: boolean | string;
+    // ส่วนที่ 7.4: สิทธิ์พนักงาน — "all" | "bills,payments" | "" (ยังไม่ migrate)
+    permissions?: string;
 };
 
 export type Bill = {
@@ -84,6 +88,51 @@ export type DashboardData = {
     }[];
     latestBill?: Bill | null;
     member?: Member;
+    // ส่วนที่ 8.2: สรุปงานของ staff วันนี้ (มีเฉพาะเมื่อ role = staff)
+    myToday?: {
+        billsCreatedToday: number;
+        paymentsReceivedToday: number;
+        amountReceivedToday: number;
+    };
+};
+
+// ส่วนที่ 4.2: ผลลัพธ์ของ createBillsBatch (success/failed ต่อรายการ)
+export type BatchBillingResult = {
+    billingPeriod: string;
+    created: number;
+    success: {
+        memberId: string;
+        houseNo: string;
+        fullName: string;
+        billId: string;
+        billNo: string;
+        totalAmount: number;
+    }[];
+    failed: {
+        memberId: string;
+        reason: string;
+    }[];
+    message: string;
+};
+
+// ส่วนที่ 5.2: ข้อมูล audit log สำหรับหน้า /audit-logs
+export type AuditLogEntry = {
+    logId: string;
+    action: string;
+    userId: string;
+    username: string;
+    role: string;
+    targetType: string;
+    targetId: string;
+    detail: string;
+    createdAt: string;
+};
+
+export type AuditLogsResponse = {
+    total: number;
+    limit: number;
+    offset: number;
+    logs: AuditLogEntry[];
 };
 
 export type PaymentChannel = {

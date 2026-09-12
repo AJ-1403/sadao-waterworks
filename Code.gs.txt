@@ -54,6 +54,12 @@ const SCHEMAS = {
     "active",
     "createdAt",
     "updatedAt",
+    /* ส่วนที่ 7.1: คอลัมน์ใหม่ "permissions" — สิทธิ์พนักงานแบบละเอียด
+       เก็บเป็น comma-separated string เช่น "bills,payments" หรือ "all"
+       เพิ่มท้าย array เท่านั้น ห้ามแทรก/ลบคอลัมน์เดิม
+       แถวเก่าที่ไม่มีค่า = undefined → ต้องรัน migrateColumns_() 1 ครั้งหลัง deploy
+       เพื่อเติม "all" ให้พนักงานเก่า (ไม่งั้นพนักงานเก่าจะโดนบล็อกทุก action) */
+    "permissions",
   ],
   Bills: [
     "billId",
@@ -92,6 +98,11 @@ const SCHEMAS = {
     "receivedBy",
     "receivedByName",
     "createdAt",
+    /* ส่วนที่ 3.2: คอลัมน์ใหม่ "voided" — mark การชำระเงินที่ถูกยกเลิก (true/false)
+       เพิ่มท้าย array เท่านั้น ห้ามแทรก/ลบคอลัมน์เดิม
+       แถวเก่าที่ไม่มีค่า = undefined → ตีความเป็น false ทุกจุดที่ใช้
+       ต้องรัน migrateColumns_() 1 ครั้งหลัง deploy เพื่อเติม header ในชีตเดิม */
+    "voided",
   ],
   Sessions: [
     "token",
@@ -173,6 +184,11 @@ function setupSystem() {
   seedDefaultSettings_();
   seedDefaultWaterRate_();
   createInitialAdmin_(adminPassword);
+
+  /* migration คอลัมน์ใหม่ (Payments.voided, Staff.permissions) — idempotent
+     รันทุกครั้งที่ setupSystem ถูกเรียกเพื่อกันลืม (ต้นทุนต่ำ: เช็คก่อนเสมอ) */
+  migrateHeaderColumn_("Payments", "voided", false);
+  migrateHeaderColumn_("Staff", "permissions", "all");
 
   SpreadsheetApp.getUi().alert(
     "ติดตั้งระบบเรียบร้อย\n\nUsername เริ่มต้น: admin\nPassword: ใช้ค่าจาก ADMIN_PASSWORD"
@@ -291,12 +307,53 @@ function dispatchAction_(request) {
       return listBills_(context, request);
 
     case "createBill":
+      // ส่วนที่ 7.3: staff ต้องมี permission "bills" (admin ผ่านเสมอ)
       requireRole_(context, ["admin", "staff"]);
+      requirePermission_(context, "bills");
       return createBill_(context, request);
 
-    case "recordPayment":
+    case "createBillsBatch":
+      // ส่วนที่ 4.1: ออกบิลยกชุด — สิทธิ์เดียวกับ createBill
       requireRole_(context, ["admin", "staff"]);
+      requirePermission_(context, "bills");
+      return createBillsBatch_(context, request);
+
+    case "editBill":
+      // ส่วนที่ 3.3: แก้ไขบิล — admin only (กระทบข้อมูลการเงิน)
+      requireRole_(context, ["admin"]);
+      return editBill_(context, request);
+
+    case "cancelBill":
+      // ส่วนที่ 3.1: ยกเลิกบิล — admin only (กระทบข้อมูลการเงิน)
+      requireRole_(context, ["admin"]);
+      return cancelBill_(context, request);
+
+    case "recordPayment":
+      // ส่วนที่ 7.3: staff ต้องมี permission "payments" (admin ผ่านเสมอ)
+      requireRole_(context, ["admin", "staff"]);
+      requirePermission_(context, "payments");
       return recordPayment_(context, request);
+
+    case "voidPayment":
+      // ส่วนที่ 3.2: ยกเลิกการชำระเงิน — admin only + permission "payments"
+      requireRole_(context, ["admin"]);
+      requirePermission_(context, "payments");
+      return voidPayment_(context, request);
+
+    case "listAuditLogs":
+      // ส่วนที่ 5.1: ประวัติการใช้งาน — admin only
+      requireRole_(context, ["admin"]);
+      return listAuditLogs_(context, request);
+
+    case "exportBills":
+      // ส่วนที่ 10.1: export ข้อมูลดิบ — admin, staff
+      requireRole_(context, ["admin", "staff"]);
+      return exportBills_(context);
+
+    case "exportPayments":
+      // ส่วนที่ 10.1: export ข้อมูลดิบ — admin, staff
+      requireRole_(context, ["admin", "staff"]);
+      return exportPayments_(context);
 
     case "listPayments":
       return listPayments_(context, request);
@@ -472,6 +529,44 @@ function requireRole_(context, roles) {
   }
 }
 
+/* ส่วนที่ 7.3: เช็คสิทธิ์แบบละเอียดสำหรับ staff
+   - admin ผ่านได้เสมอ ไม่ต้องเช็ค
+   - staff ต้องมี permission ในคอลัมน์ Staff.permissions (comma-separated หรือ "all")
+   - พนักงานเก่าที่ยังไม่มีค่า (undefined/empty) จะถูกปฏิเสธ — ต้องรัน migrateColumns_() */
+function requirePermission_(context, permission) {
+  if (context.user.role === "admin") {
+    return;
+  }
+
+  if (context.user.role !== "staff") {
+    throw new Error("คุณไม่มีสิทธิ์ดำเนินการในรายการนี้");
+  }
+
+  const staff = context.user.staffId
+    ? findOne_("Staff", function (row) {
+        return row.staffId === context.user.staffId;
+      })
+    : null;
+
+  const permissions = String((staff && staff.permissions) || "").trim();
+
+  if (
+    permissions.toLowerCase() === "all" ||
+    permissions
+      .split(",")
+      .map(function (part) {
+        return part.trim().toLowerCase();
+      })
+      .indexOf(permission.toLowerCase()) !== -1
+  ) {
+    return;
+  }
+
+  throw new Error(
+    "คุณไม่มีสิทธิ์ดำเนินการส่วนนี้ (ต้องการสิทธิ์: " + permission + ")"
+  );
+}
+
 function publicUser_(user) {
   return {
     userId: user.userId,
@@ -564,7 +659,7 @@ function getDashboard_(context) {
 
     result.member = member ? publicMember_(member) : null;
     result.latestBill = latestBill || null;
-  } else {
+    } else {
     result.summary.totalMembers = allObjects_("Members").filter(function (
       member
     ) {
@@ -574,6 +669,34 @@ function getDashboard_(context) {
     result.summary.totalStaff = allObjects_("Staff").filter(function (staff) {
       return isActive_(staff.active);
     }).length;
+
+    /* ส่วนที่ 8.1: myToday สำหรับ staff — สรุปงานของตัวเองวันนี้
+       (billsCreatedToday จาก Bills.createdBy + createdAt วันนี้
+        paymentsReceivedToday/amountReceivedToday จาก Payments.receivedBy + paidAt วันนี้)
+       ใช้ TIMEZONE จาก CONFIG ทั้งหมด ไม่กระทบ response ของ admin/member เดิม */
+    if (context.user.role === "staff") {
+      const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd");
+
+      const myBills = allObjects_("Bills").filter(function (bill) {
+        return bill.createdBy === context.user.userId &&
+          String(bill.createdAt || "").slice(0, 10) === today;
+      }).length;
+
+      const myPayments = allObjects_("Payments").filter(function (payment) {
+        return payment.receivedBy === context.user.userId &&
+          String(payment.paidAt || "").slice(0, 10) === today;
+      });
+
+      result.myToday = {
+        billsCreatedToday: myBills,
+        paymentsReceivedToday: myPayments.length,
+        amountReceivedToday: roundMoney_(
+          myPayments.reduce(function (total, payment) {
+            return total + number_(payment.amount);
+          }, 0)
+        ),
+      };
+    }
   }
 
   return result;
@@ -584,14 +707,44 @@ function getDashboard_(context) {
    ========================================================================== */
 
 function listMembers_() {
+  /* ส่วนที่ 6.1: คำนวณ lastMeterReading (เลขมิเตอร์ครั้งก่อน) ต่อลูกบ้าน
+     จากบิลล่าสุด (billingPeriod มากที่สุด) ที่ status !== "cancelled"
+     — อ่าน Bills 1 ครั้งจาก memoization (ไม่เพิ่ม round-trip Sheets API
+     เพราะ Bills ไม่ถูก CacheService cache แต่ memo ครอบภายใน execution เดียว)
+     ถ้าไม่เคยมีบิล → ใช้ initialMeter ของลูกบ้าน */
+  const bills = allObjects_("Bills");
+  const lastMeterMap = {};
+
+  bills.forEach(function (bill) {
+    if (bill.status === "cancelled") return;
+
+    const existing = lastMeterMap[bill.memberId];
+
+    if (!existing || String(bill.billingPeriod) > existing.billingPeriod) {
+      lastMeterMap[bill.memberId] = {
+        billingPeriod: String(bill.billingPeriod || ""),
+        meter: number_(bill.currentMeter),
+      };
+    }
+  });
+
   return allObjects_("Members")
     .sort(function (a, b) {
       return String(a.houseNo).localeCompare(String(b.houseNo), "th");
     })
-    .map(publicMember_);
+    .map(function (member) {
+      return publicMember_(member, lastMeterMap);
+    });
 }
 
-function publicMember_(member) {
+/* ส่วนที่ 6.1: lastMeterMap เป็น optional — ถ้าไม่ส่งมา (เช่นจาก getDashboard_)
+   จะ fallback เป็น initialMeter เหมือนเดิม (backward compatible) */
+function publicMember_(member, lastMeterMap) {
+  const lastMeter =
+    lastMeterMap && lastMeterMap[member.memberId]
+      ? lastMeterMap[member.memberId].meter
+      : number_(member.initialMeter);
+
   return {
     memberId: member.memberId,
     houseNo: member.houseNo,
@@ -599,6 +752,8 @@ function publicMember_(member) {
     phone: member.phone || "",
     address: member.address || "",
     initialMeter: number_(member.initialMeter),
+    // ส่วนที่ 6.1: field ใหม่ — เลขมิเตอร์ครั้งก่อนของบ้านนี้ (ต้องอัปเดต types/index.ts)
+    lastMeterReading: lastMeter,
     active: isActive_(member.active),
     createdAt: member.createdAt,
     updatedAt: member.updatedAt,
@@ -837,6 +992,9 @@ function publicStaff_(staff) {
     position: staff.position,
     phone: staff.phone || "",
     active: isActive_(staff.active),
+    /* ส่วนที่ 7.2: คอลัมน์ใหม่ permissions — พนักงานเก่าที่ยังไม่มีค่า
+       (ยังไม่ได้รัน migrateColumns_) แสดงเป็น "" ให้ UI เตือนว่าต้อง migrate */
+    permissions: String(staff.permissions || "").trim(),
     createdAt: staff.createdAt,
     updatedAt: staff.updatedAt,
   };
@@ -875,6 +1033,10 @@ function createStaff_(context, request) {
       active: true,
       createdAt: now,
       updatedAt: now,
+      /* ส่วนที่ 7.2: คอลัมน์ใหม่ permissions — รับจาก request.permissions
+         (array หรือ comma-separated string) ถ้าไม่ส่งมา default เป็น "" 
+         (แนะนำให้ UI ส่ง ["bills","payments"] หรือ ["all"] เสมอ) */
+      permissions: normalizePermissions_(request.permissions),
     });
 
     appendObject_("Users", {
@@ -945,6 +1107,11 @@ function updateStaff_(context, request) {
       fullName: fullName,
       position: position,
       phone: phone,
+      /* ส่วนที่ 7.2: อัปเดตสิทธิ์พนักงาน (ถ้า request ส่ง permissions มาเท่านั้น
+         — ไม่ส่ง = คงค่าเดิม เพื่อ backward compatible กับ client เก่า) */
+      ...(request.permissions !== undefined
+        ? { permissions: normalizePermissions_(request.permissions) }
+        : {}),
       updatedAt: now,
     });
 
@@ -1037,6 +1204,10 @@ function toggleStaffStatus_(context, request) {
 function listBills_(context, request) {
   const status = String(request.status || "").trim();
   const billingPeriod = String(request.billingPeriod || "").trim();
+  /* ส่วนที่ 9.1: filter ใหม่ — ค้นหา partial match case-insensitive ที่ฝั่ง backend
+     ลด payload ที่ส่งกลับ (เดิมส่งทั้งหมดแล้วให้หน้าเว็บกรองเอง) */
+  const houseNo = String(request.houseNo || "").trim().toLowerCase();
+  const fullName = String(request.fullName || "").trim().toLowerCase();
 
   // pagination options (backward-compatible: ไม่ส่ง param = ได้ทั้งหมดเหมือนเดิม)
   const listOptions = {
@@ -1066,6 +1237,20 @@ function listBills_(context, request) {
   if (billingPeriod) {
     bills = bills.filter(function (bill) {
       return bill.billingPeriod === billingPeriod;
+    });
+  }
+
+  /* ส่วนที่ 9.1: ใช้งาน filter ใหม่ — partial match แบบ case-insensitive
+     ใช้เงื่อนไข OR เมื่อส่งมาทั้งคู่ เพื่อรองรับช่องค้นหาเดียวของ UI
+     (ค้นด้วยบ้านเลขที่หรือชื่อก็เจอ — ส่งค่าเดิมซ้ำใน houseNo/fullName ก็ยังทำงานถูก) */
+  if (houseNo || fullName) {
+    bills = bills.filter(function (bill) {
+      const houseMatch =
+        houseNo && String(bill.houseNo).toLowerCase().indexOf(houseNo) !== -1;
+      const nameMatch =
+        fullName && String(bill.ownerName).toLowerCase().indexOf(fullName) !== -1;
+
+      return houseMatch || nameMatch;
     });
   }
 
@@ -1420,6 +1605,9 @@ function recordPayment_(context, request) {
       receivedBy: context.user.userId,
       receivedByName: context.user.fullName,
       createdAt: now,
+      /* ส่วนที่ 3.2: คอลัมน์ใหม่ "voided" — รายการใหม่เริ่มเป็น false เสมอ
+         (แถวเก่าที่ไม่มีค่า = undefined ซึ่งตีความเป็น false ได้เหมือนกัน) */
+      voided: false,
     });
 
     updateObject_("Bills", bill.__row, {
@@ -1454,6 +1642,16 @@ function listPayments_(context, request) {
   const options = request || {};
 
   let payments = allObjects_("Payments");
+
+  /* ส่วนที่ 3.2: ซ่อนรายการชำระเงินที่ถูกยกเลิก (voided) ออกจาก list ปกติ
+     — ยังเก็บแถวไว้ในชีตเพื่อการตรวจสอบย้อนหลัง (เห็นได้ผ่าน exportPayments)
+     แถวเก่าที่ voided = undefined ถือว่าไม่ถูก void */
+  payments = payments.filter(function (payment) {
+    return !(
+      payment.voided === true ||
+      String(payment.voided).toLowerCase() === "true"
+    );
+  });
 
   if (context.user.role === "member") {
     payments = payments.filter(function (payment) {
@@ -1537,6 +1735,661 @@ function getReceipt_(context, request) {
       villagePhone: village.villagePhone || "",
     },
   };
+}
+
+/* ส่วนที่ 7.2 (helper): แปลง input สิทธิ์เป็น comma-separated string
+   รับได้ทั้ง array (จาก UI checkbox) และ string — เก็บได้: all, bills, payments */
+function normalizePermissions_(input) {
+  let parts = [];
+
+  if (Array.isArray(input)) {
+    parts = input.map(function (part) {
+      return String(part).trim();
+    });
+  } else {
+    parts = String(input || "").split(",");
+  }
+
+  const allowed = ["all", "bills", "payments"];
+  const seen = {};
+
+  const result = parts
+    .map(function (part) {
+      return part.toLowerCase();
+    })
+    .filter(function (part) {
+      if (allowed.indexOf(part) === -1 || seen[part]) return false;
+      seen[part] = true;
+      return true;
+    });
+
+  if (seen.all) {
+    return "all";
+  }
+
+  return result.join(",");
+}
+
+/* ==========================================================================
+   BILL MANAGEMENT — ส่วนที่ 3: cancelBill / editBill / voidPayment
+   ========================================================================== */
+
+/* ส่วนที่ 3.1: ยกเลิกบิล (admin only — ตรวจสิทธิ์ใน dispatchAction_ แล้ว)
+   - ห้ามยกเลิกบิลที่มีเงินเข้ามาแล้ว (paidAmount > 0) — ต้อง voidPayment ก่อน
+   - เก็บ reason ต่อท้าย field note เดิม (ไม่ทับข้อมูลเดิม) */
+function cancelBill_(context, request) {
+  return withLock_(function () {
+    const billId = String(request.billId || "").trim();
+    const reason = String(request.reason || "").trim();
+
+    if (!billId || !reason) {
+      throw new Error("กรุณาระบุบิลและเหตุผลในการยกเลิก");
+    }
+
+    // อ่าน Bills จากข้อมูลสด (memo ต่อ execution — invalidate หลังเขียนเสมอ)
+    const bills = allObjects_("Bills");
+    const bill = bills.find(function (row) {
+      return row.billId === billId;
+    });
+
+    if (!bill) {
+      throw new Error("ไม่พบข้อมูลบิล");
+    }
+
+    if (bill.status === "cancelled") {
+      throw new Error("บิลนี้ถูกยกเลิกไปแล้ว");
+    }
+
+    if (number_(bill.paidAmount) > 0) {
+      // กันการยกเลิกบิลที่ลูกบ้านจ่ายเงินแล้ว — เงินที่รับไปจะหายจากระบบบัญชี
+      throw new Error(
+        "ไม่สามารถยกเลิกบิลได้เนื่องจากมีการชำระเงินแล้ว " +
+          number_(bill.paidAmount) +
+          " บาท (บิล " +
+          bill.billNo +
+          ") กรุณายกเลิกการชำระเงิน (voidPayment) ก่อนยกเลิกบิล"
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    updateObject_("Bills", bill.__row, {
+      status: "cancelled",
+      // เก็บ reason ต่อท้าย note เดิม ไม่ทับ
+      note:
+        (bill.note ? String(bill.note) + " | " : "") +
+        "ยกเลิก: " + reason + " (โดย " + context.user.fullName + " เมื่อ " + now + ")",
+      updatedAt: now,
+    });
+
+    logAudit_(
+      context,
+      "CANCEL_BILL",
+      "Bill",
+      billId,
+      "ยกเลิกบิล " + bill.billNo + " เหตุผล: " + reason
+    );
+
+    return {
+      billId: billId,
+      billNo: bill.billNo,
+      status: "cancelled",
+      message: "ยกเลิกบิลเรียบร้อย",
+    };
+  });
+}
+
+/* ส่วนที่ 3.3: แก้ไขบิล (admin only) — ได้เฉพาะบิลที่ยังไม่มีการชำระเงินเข้ามาเลย
+   แก้ได้: currentMeter, dueDate, note — คำนวณ unitsUsed/ยอดเงินใหม่ทุกครั้ง
+   ด้วย calculateWaterCharge_ เดิม (ใช้เรทตามวันที่ 1 ของรอบบิลเดิมเสมอ) */
+function editBill_(context, request) {
+  return withLock_(function () {
+    const billId = String(request.billId || "").trim();
+    const currentMeter = number_(request.currentMeter);
+    const dueDate = request.dueDate ? dateKey_(request.dueDate) : "";
+    const note = String(request.note || "").trim();
+
+    if (!billId) {
+      throw new Error("กรุณาระบุบิลที่ต้องการแก้ไข");
+    }
+
+    const bills = allObjects_("Bills");
+    const bill = bills.find(function (row) {
+      return row.billId === billId;
+    });
+
+    if (!bill) {
+      throw new Error("ไม่พบข้อมูลบิล");
+    }
+
+    if (bill.status === "cancelled") {
+      throw new Error("บิลที่ยกเลิกแล้วแก้ไขไม่ได้");
+    }
+
+    if (number_(bill.paidAmount) > 0) {
+      throw new Error(
+        "แก้ไขได้เฉพาะบิลที่ยังไม่มีการชำระเงินเท่านั้น (บิลนี้ชำระแล้ว " +
+          number_(bill.paidAmount) +
+          " บาท กรุณา voidPayment ก่อนแก้ไข)"
+      );
+    }
+
+    const previousMeter = number_(bill.previousMeter);
+
+    if (currentMeter < previousMeter) {
+      throw new Error(
+        "เลขมิเตอร์ปัจจุบันต้องไม่น้อยกว่าเลขมิเตอร์เดิม (" + previousMeter + ")"
+      );
+    }
+
+    const unitsUsed = currentMeter - previousMeter;
+    const charge = calculateWaterCharge_(
+      unitsUsed,
+      String(bill.billingPeriod) + "-01"
+    );
+    const now = new Date().toISOString();
+
+    updateObject_("Bills", bill.__row, {
+      currentMeter: currentMeter,
+      unitsUsed: unitsUsed,
+      waterAmount: charge.waterAmount,
+      serviceFee: charge.serviceFee,
+      vatAmount: charge.vatAmount,
+      totalAmount: charge.totalAmount,
+      // dueDate อัปเดตเมื่อส่งค่ามาเท่านั้น (ไม่ส่ง = คงค่าเดิม)
+      ...(dueDate ? { dueDate: dueDate } : {}),
+      note: note,
+      updatedAt: now,
+    });
+
+    logAudit_(
+      context,
+      "EDIT_BILL",
+      "Bill",
+      billId,
+      "แก้ไขบิล " + bill.billNo + " (มิเตอร์ " + previousMeter + " → " + currentMeter + ")"
+    );
+
+    return {
+      billId: billId,
+      billNo: bill.billNo,
+      unitsUsed: unitsUsed,
+      waterAmount: charge.waterAmount,
+      serviceFee: charge.serviceFee,
+      vatAmount: charge.vatAmount,
+      totalAmount: charge.totalAmount,
+      message: "แก้ไขบิลเรียบร้อย",
+    };
+  });
+}
+
+/* ส่วนที่ 3.2: ยกเลิกการชำระเงิน (admin only + permission "payments")
+   - ลด paidAmount ของบิลลงตามจำนวนที่ void และปรับ status กลับ "unpaid"
+     ถ้ายอดคงเหลือไม่ครบ (ไม่แตะบิลที่ status cancelled)
+   - ไม่ลบแถวการชำระ — mark ด้วยคอลัมน์ใหม่ voided = true (ท้าย SCHEMAS.Payments)
+     เพื่อรักษาประวัติตรวจสอบย้อนหลัง + เหตุผลต่อท้าย paymentNote */
+function voidPayment_(context, request) {
+  return withLock_(function () {
+    const paymentId = String(request.paymentId || "").trim();
+    const reason = String(request.reason || "").trim();
+
+    if (!paymentId || !reason) {
+      throw new Error("กรุณาระบุรายการชำระเงินและเหตุผลในการยกเลิก");
+    }
+
+    const payments = allObjects_("Payments");
+    const payment = payments.find(function (row) {
+      return row.paymentId === paymentId;
+    });
+
+    if (!payment) {
+      throw new Error("ไม่พบข้อมูลการชำระเงิน");
+    }
+
+    if (
+      payment.voided === true ||
+      String(payment.voided).toLowerCase() === "true"
+    ) {
+      throw new Error("รายการชำระเงินนี้ถูกยกเลิกไปแล้ว");
+    }
+
+    const bills = allObjects_("Bills");
+    const bill = bills.find(function (row) {
+      return row.billId === payment.billId;
+    });
+
+    if (!bill) {
+      throw new Error("ไม่พบข้อมูลบิลของรายการชำระนี้");
+    }
+
+    const voidAmount = number_(payment.amount);
+    const now = new Date().toISOString();
+
+    // mark รายการชำระเป็น voided — ห้ามลบแถวจริง (รักษา audit trail)
+    updateObject_("Payments", payment.__row, {
+      voided: true,
+      // เหตุผลต่อท้าย paymentNote เดิม ไม่ทับ
+      paymentNote:
+        (payment.paymentNote ? String(payment.paymentNote) + " | " : "") +
+        "VOID: " + reason + " (โดย " + context.user.fullName + " เมื่อ " + now + ")",
+    });
+
+    // ปรับบิล: ลด paidAmount ลงตามจำนวนที่ void และคำนวณ status ใหม่
+    const newPaidAmount = Math.max(0, number_(bill.paidAmount) - voidAmount);
+    let newStatus = bill.status;
+
+    if (bill.status !== "cancelled") {
+      // กติกาเดียวกับ recordPayment_: ครบยอด = paid, ไม่ครบ = unpaid
+      newStatus =
+        number_(bill.totalAmount) - newPaidAmount <= 0 ? "paid" : "unpaid";
+    }
+
+    updateObject_("Bills", bill.__row, {
+      paidAmount: newPaidAmount,
+      status: newStatus,
+      updatedAt: now,
+    });
+
+    logAudit_(
+      context,
+      "VOID_PAYMENT",
+      "Payment",
+      paymentId,
+      "ยกเลิกการชำระ " + voidAmount + " บาท จากบิล " + bill.billNo + " เหตุผล: " + reason
+    );
+
+    return {
+      paymentId: paymentId,
+      paymentNo: payment.paymentNo,
+      billId: bill.billId,
+      billNo: bill.billNo,
+      voidedAmount: voidAmount,
+      paidAmount: newPaidAmount,
+      remainingAmount: roundMoney_(number_(bill.totalAmount) - newPaidAmount),
+      status: newStatus,
+      message: "ยกเลิกการชำระเงินเรียบร้อย",
+    };
+  });
+}
+
+/* ส่วนที่ 4.1: ออกบิลยกชุด (admin, staff + permission "bills")
+   - รับ { billingPeriod, dueDate, bills: [{ memberId, currentMeter }] }
+   - ล็อกครั้งเดียวสำหรับทั้ง batch เพื่อความเร็ว
+   - รายการไหน error ให้ข้ามและทำรายการอื่นต่อ — return { success, failed }
+     ไม่ throw ทั้ง batch เพราะรายการเดียวพัง
+   - ใช้ counter เดียวกับ 1.6 (SEQ_*) เลขบิลต่อเนื่องถูกต้องทุกใบ */
+function createBillsBatch_(context, request) {
+  return withLock_(function () {
+    const billingPeriod = String(request.billingPeriod || "").trim();
+    const dueDate = dateKey_(request.dueDate);
+    const entries = Array.isArray(request.bills) ? request.bills : [];
+
+    if (!billingPeriod || !dueDate) {
+      throw new Error("กรุณาระบุรอบบิลและวันครบกำหนด");
+    }
+
+    if (!/^\d{4}-\d{2}$/.test(billingPeriod)) {
+      throw new Error("รอบบิลต้องอยู่ในรูปแบบ YYYY-MM เช่น 2026-08");
+    }
+
+    if (!entries.length) {
+      throw new Error("กรุณาระบุรายชื่อลูกบ้านและเลขมิเตอร์อย่างน้อย 1 รายการ");
+    }
+
+    // อ่านตารางครั้งเดียวสำหรับทั้ง batch (execution cache ครอบอยู่แล้ว)
+    const members = allObjects_("Members");
+    const bills = allObjects_("Bills");
+
+    // map เช็ค duplicate แบบ O(1) ต่อรายการ (แทน find วนซ้ำทุกใบ)
+    const billedMembers = {};
+
+    bills.forEach(function (bill) {
+      if (bill.billingPeriod === billingPeriod && bill.status !== "cancelled") {
+        billedMembers[bill.memberId] = bill.billNo;
+      }
+    });
+
+    // map เลขมิเตอร์ครั้งก่อนต่อลูกบ้าน (บิลล่าสุดที่ไม่ cancelled)
+    const latestMeter = {};
+
+    bills.forEach(function (bill) {
+      if (bill.status === "cancelled") return;
+
+      const existing = latestMeter[bill.memberId];
+
+      if (!existing || String(bill.billingPeriod) > existing.billingPeriod) {
+        latestMeter[bill.memberId] = {
+          billingPeriod: String(bill.billingPeriod || ""),
+          meter: number_(bill.currentMeter),
+        };
+      }
+    });
+
+    const success = [];
+    const failed = [];
+    const now = new Date().toISOString();
+
+    entries.forEach(function (entry) {
+      const memberId = String((entry && entry.memberId) || "").trim();
+      const currentMeter = number_(entry && entry.currentMeter);
+
+      try {
+        if (!memberId) {
+          throw new Error("ไม่ระบุ memberId");
+        }
+
+        const member = members.find(function (row) {
+          return row.memberId === memberId;
+        });
+
+        if (!member || !isActive_(member.active)) {
+          throw new Error("ไม่พบลูกบ้าน หรือบัญชีถูกปิดใช้งาน");
+        }
+
+        if (billedMembers[memberId]) {
+          throw new Error(
+            "มีบิลในรอบนี้แล้ว (เลขบิลเดิม: " + billedMembers[memberId] + ")"
+          );
+        }
+
+        const previousMeter = latestMeter[memberId]
+          ? latestMeter[memberId].meter
+          : number_(member.initialMeter);
+
+        if (currentMeter < previousMeter) {
+          throw new Error(
+            "เลขมิเตอร์ปัจจุบัน (" +
+              currentMeter +
+              ") น้อยกว่าครั้งก่อน (" +
+              previousMeter +
+              ")"
+          );
+        }
+
+        const unitsUsed = currentMeter - previousMeter;
+        const charge = calculateWaterCharge_(unitsUsed, billingPeriod + "-01");
+        const billId = "BIL-" + Utilities.getUuid();
+
+        // generateBillNo_ ใช้ counter SEQ_* — ส่ง bills array เดิมต่อเนื่อง
+        // ไม่ต้อง re-read ทั้งตารางในแต่ละใบ
+        const billNo = generateBillNo_(billingPeriod, bills);
+
+        appendObject_("Bills", {
+          billId: billId,
+          billNo: billNo,
+          memberId: member.memberId,
+          houseNo: member.houseNo,
+          ownerName: member.fullName,
+          billingPeriod: billingPeriod,
+          previousMeter: previousMeter,
+          currentMeter: currentMeter,
+          unitsUsed: unitsUsed,
+          waterAmount: charge.waterAmount,
+          serviceFee: charge.serviceFee,
+          vatAmount: charge.vatAmount,
+          totalAmount: charge.totalAmount,
+          paidAmount: 0,
+          status: "unpaid",
+          dueDate: dueDate,
+          note: "",
+          createdAt: now,
+          createdBy: context.user.userId,
+          updatedAt: now,
+        });
+
+        // อัปเดต local state ให้รายการถัดไปเห็นบิลที่เพิ่งสร้าง
+        // (กัน memberId ซ้ำใน batch เดียว + เลขมิเตอร์ครั้งก่อนถูกต้อง)
+        bills.push({
+          billId: billId,
+          billNo: billNo,
+          memberId: memberId,
+          billingPeriod: billingPeriod,
+          status: "unpaid",
+          currentMeter: currentMeter,
+        });
+        billedMembers[memberId] = billNo;
+        latestMeter[memberId] = {
+          billingPeriod: billingPeriod,
+          meter: currentMeter,
+        };
+
+        success.push({
+          memberId: memberId,
+          houseNo: member.houseNo,
+          fullName: member.fullName,
+          billId: billId,
+          billNo: billNo,
+          totalAmount: charge.totalAmount,
+        });
+      } catch (error) {
+        failed.push({
+          memberId: memberId,
+          reason:
+            error && error.message
+              ? error.message
+              : "เกิดข้อผิดพลาดไม่ทราบสาเหตุ",
+        });
+      }
+    });
+
+    if (success.length) {
+      logAudit_(
+        context,
+        "CREATE_BILLS_BATCH",
+        "Bill",
+        "",
+        "ออกบิลยกชุดรอบ " + billingPeriod + " สำเร็จ " + success.length + " รายการ (ล้มเหลว " + failed.length + ")"
+      );
+    }
+
+    return {
+      billingPeriod: billingPeriod,
+      created: success.length,
+      success: success,
+      failed: failed,
+      message:
+        "ออกบิลสำเร็จ " + success.length + " รายการ, ล้มเหลว " + failed.length + " รายการ",
+    };
+  });
+}
+
+/* ==========================================================================
+   AUDIT LOG VIEWER + EXPORT — ส่วนที่ 5 และ 10
+   ========================================================================== */
+
+/* ส่วนที่ 5.1: อ่านประวัติการใช้งาน (admin only)
+   filter เสริม: startDate, endDate (YYYY-MM-DD), action, userId
+   เรียงใหม่→เก่า, limit default 200, รองรับ offset สำหรับ pagination */
+function listAuditLogs_(context, request) {
+  const options = request || {};
+
+  const startDate = options.startDate ? dateKey_(options.startDate) : "";
+  const endDate = options.endDate ? dateKey_(options.endDate) : "";
+  const action = String(options.action || "").trim().toLowerCase();
+  const userId = String(options.userId || "").trim();
+
+  const limit = Math.max(1, number_(options.limit) || 200);
+  const offset = Math.max(0, number_(options.offset));
+
+  // AuditLogs ไม่ถูก CacheService cache (ต้อง real-time) — อ่านสดผ่าน memo
+  let logs = allObjects_("AuditLogs").filter(function (log) {
+    const createdDate = String(log.createdAt || "").slice(0, 10);
+
+    if (startDate && createdDate < startDate) return false;
+    if (endDate && createdDate > endDate) return false;
+    if (action && String(log.action || "").toLowerCase() !== action) return false;
+    if (userId && log.userId !== userId) return false;
+
+    return true;
+  });
+
+  logs = logs.sort(function (a, b) {
+    return String(b.createdAt).localeCompare(String(a.createdAt));
+  });
+
+  return {
+    total: logs.length,
+    limit: limit,
+    offset: offset,
+    logs: logs.slice(offset, offset + limit).map(function (log) {
+      return {
+        logId: log.logId,
+        action: log.action,
+        userId: log.userId,
+        username: log.username,
+        role: log.role,
+        targetType: log.targetType,
+        targetId: log.targetId,
+        detail: log.detail,
+        createdAt: log.createdAt,
+      };
+    }),
+  };
+}
+
+/* ส่วนที่ 10.1: export ข้อมูลดิบทั้งหมด (ไม่จำกัด limit เหมือน listBills)
+   แยก action ออกจาก listBills เพื่อไม่ให้ UI ปกติยิงข้อมูลหนักโดยไม่จำเป็น */
+function exportBills_(context) {
+  const bills = allObjects_("Bills").map(addBillDisplayFields_);
+
+  logAudit_(
+    context,
+    "EXPORT_BILLS",
+    "Bill",
+    "",
+    "ส่งออกข้อมูลบิลทั้งหมด " + bills.length + " รายการ"
+  );
+
+  return bills.map(function (bill) {
+    return {
+      billId: bill.billId,
+      billNo: bill.billNo,
+      memberId: bill.memberId,
+      houseNo: bill.houseNo,
+      ownerName: bill.ownerName,
+      billingPeriod: bill.billingPeriod,
+      previousMeter: number_(bill.previousMeter),
+      currentMeter: number_(bill.currentMeter),
+      unitsUsed: number_(bill.unitsUsed),
+      waterAmount: number_(bill.waterAmount),
+      serviceFee: number_(bill.serviceFee),
+      vatAmount: number_(bill.vatAmount),
+      totalAmount: number_(bill.totalAmount),
+      paidAmount: number_(bill.paidAmount),
+      remainingAmount: number_(bill.remainingAmount),
+      status: bill.status,
+      displayStatus: bill.displayStatus,
+      dueDate: bill.dueDate,
+      note: bill.note,
+      createdAt: bill.createdAt,
+      createdBy: bill.createdBy,
+    };
+  });
+}
+
+/* ส่วนที่ 10.1: export การชำระเงินทั้งหมด "รวมรายการที่ถูก void"
+   (มี flag voided) เพื่อให้บัญชีตรวจสอบย้อนหลังได้ครบถ้วน */
+function exportPayments_(context) {
+  const payments = allObjects_("Payments");
+
+  logAudit_(
+    context,
+    "EXPORT_PAYMENTS",
+    "Payment",
+    "",
+    "ส่งออกข้อมูลการชำระเงินทั้งหมด " + payments.length + " รายการ"
+  );
+
+  return payments.map(function (payment) {
+    return {
+      paymentId: payment.paymentId,
+      paymentNo: payment.paymentNo,
+      billId: payment.billId,
+      billNo: payment.billNo,
+      memberId: payment.memberId,
+      houseNo: payment.houseNo,
+      ownerName: payment.ownerName,
+      amount: number_(payment.amount),
+      paymentMethod: payment.paymentMethod,
+      paymentNote: payment.paymentNote,
+      paidAt: payment.paidAt,
+      receivedBy: payment.receivedBy,
+      receivedByName: payment.receivedByName,
+      createdAt: payment.createdAt,
+      voided:
+        payment.voided === true ||
+        String(payment.voided).toLowerCase() === "true",
+    };
+  });
+}
+
+/* ==========================================================================
+   MIGRATION — คอลัมน์ใหม่ท้ายตาราง (รัน 1 ครั้งหลัง deploy)
+   ========================================================================== */
+
+/* เพิ่ม header คอลัมน์ใหม่ให้ชีตที่มีข้อมูลอยู่แล้ว + เติมค่า default ให้แถวเก่า:
+   - Payments: คอลัมน์ "voided" → เติม false ให้แถวเก่า
+   - Staff: คอลัมน์ "permissions" → เติม "all" ให้พนักงานเก่า
+     (สำคัญมาก — ไม่รันแล้วพนักงานเก่าจะโดนบล็อก createBill/recordPayment)
+   รันซ้ำได้ (idempotent) — เช็คก่อนเสมอ ว่างเท่านั้นถึงเติม
+   วิธีใช้: Apps Script editor > เลือก migrateColumns_ > Run (1 ครั้ง)
+   (setupSystem ก็เรียกให้อัตโนมัติเพื่อกันลืมตอนติดตั้งใหม่) */
+function migrateColumns_() {
+  migrateHeaderColumn_("Payments", "voided", false);
+  migrateHeaderColumn_("Staff", "permissions", "all");
+
+  try {
+    SpreadsheetApp.getUi().alert(
+      "migrateColumns_ เสร็จสมบูรณ์\n\n" +
+        "- Payments: เพิ่มคอลัมน์ voided (default: false)\n" +
+        "- Staff: เพิ่มคอลัมน์ permissions (default: all)"
+    );
+  } catch (error) {
+    // รันจาก context ที่ไม่มี UI (trigger/webapp) → ข้าม alert (migrate เสร็จแล้ว)
+  }
+}
+
+/* helper ของ migrateColumns_: เติม header ที่ท้ายแถว 1 ถ้ายังว่าง แล้วเติม default
+   ให้แถวเก่าที่ค่าว่าง — เขียน batch เดียวต่อคอลัมน์ (เร็ว ไม่วน setValues ทีละแถว) */
+function migrateHeaderColumn_(sheetName, headerName, defaultValue) {
+  const sheet = getSheet_(sheetName);
+  const headers = SCHEMAS[sheetName];
+  const columnIndex = headers.indexOf(headerName) + 1; // 1-based
+
+  if (columnIndex === 0) {
+    throw new Error(
+      "ไม่พบคอลัมน์ " + headerName + " ใน SCHEMAS." + sheetName
+    );
+  }
+
+  const lastRow = sheet.getLastRow();
+
+  // 1) เติม header ที่แถว 1 คอลัมน์ที่ท้ายสุด (ตารางเก่าไม่มี header นี้)
+  const headerCell = sheet.getRange(1, columnIndex);
+
+  if (!headerCell.getValue()) {
+    headerCell.setValue(headerName);
+  }
+
+  if (lastRow < 2) {
+    return; // ไม่มีแถวข้อมูล — ไม่ต้องเติม default
+  }
+
+  // 2) อ่านคอลัมน์นั้นทั้งหมด แล้วเติม defaultValue เฉพาะช่องที่ว่าง
+  const columnRange = sheet.getRange(2, columnIndex, lastRow - 1, 1);
+  const values = columnRange.getValues();
+  let changed = false;
+
+  for (let i = 0; i < values.length; i++) {
+    if (values[i][0] === "" || values[i][0] === null) {
+      values[i][0] = defaultValue;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    columnRange.setValues(values);
+  }
 }
 
 /* ==========================================================================

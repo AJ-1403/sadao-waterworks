@@ -11,6 +11,7 @@ import {
   LogOut,
   Menu,
   QrCode,
+  ScrollText,
   Settings,
   UserCog,
   Users,
@@ -69,6 +70,13 @@ const menuItems: MenuItem[] = [
     label: "รายงาน",
     icon: BarChart3,
     roles: ["admin", "staff"],
+  },
+  {
+    // ส่วนที่ 5.2: เมนูประวัติการใช้งาน — admin only
+    href: "/audit-logs",
+    label: "ประวัติการใช้งาน",
+    icon: ScrollText,
+    roles: ["admin"],
   },
   {
     href: "/settings",

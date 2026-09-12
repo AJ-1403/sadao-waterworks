@@ -138,6 +138,35 @@ export function DashboardPage() {
         </Card>
       )}
 
+      {/* ส่วนที่ 8.2: Card "งานของฉันวันนี้" — แสดงเฉพาะ role staff */}
+      {user.role === "staff" && data.myToday && (
+        <Card className="border-teal-200">
+          <CardHeader>
+            <CardTitle className="text-lg">งานของฉันวันนี้</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-3">
+            <div className="rounded-lg bg-teal-50 p-4">
+              <p className="text-sm text-muted-foreground">บิลที่ฉันออกวันนี้</p>
+              <p className="mt-1 text-2xl font-bold text-teal-700">
+                {data.myToday.billsCreatedToday}
+              </p>
+            </div>
+            <div className="rounded-lg bg-blue-50 p-4">
+              <p className="text-sm text-muted-foreground">รายการชำระที่ฉันรับวันนี้</p>
+              <p className="mt-1 text-2xl font-bold text-blue-700">
+                {data.myToday.paymentsReceivedToday}
+              </p>
+            </div>
+            <div className="rounded-lg bg-emerald-50 p-4">
+              <p className="text-sm text-muted-foreground">ยอดเงินที่ฉันรับวันนี้</p>
+              <p className="mt-1 text-2xl font-bold text-emerald-700">
+                {money(data.myToday.amountReceivedToday)}
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="text-lg">สรุปรายเดือนย้อนหลัง 12 เดือน</CardTitle>

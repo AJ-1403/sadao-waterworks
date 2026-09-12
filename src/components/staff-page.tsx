@@ -21,6 +21,10 @@ export function StaffPage() {
   // ข้อ 2.4/2.5: SaveState + กัน double-submit สำหรับ createStaff
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState("");
+  // ส่วนที่ 7.4: สิทธิ์พนักงาน (checkbox) — default เป็น "all" เพื่อ backward compatible
+  const [permAll, setPermAll] = useState(true);
+  const [permBills, setPermBills] = useState(false);
+  const [permPayments, setPermPayments] = useState(false);
 
   /* ข้อ 2.4: แสดงข้อความสำเร็จค้างไว้ 2.5 วินาทีแล้วกลับสู่ idle */
   function flashSuccess(text: string) {
@@ -62,6 +66,13 @@ export function StaffPage() {
         position: form.get("position"),
         phone: form.get("phone"),
         password: form.get("password"),
+        // ส่วนที่ 7.4: ส่งสิทธิ์ที่เลือกเป็น array — backend จะ normalize เป็น string
+        permissions: permAll
+          ? ["all"]
+          : [
+              ...(permBills ? ["bills"] : []),
+              ...(permPayments ? ["payments"] : []),
+            ],
       });
 
       setOpen(false);
@@ -118,6 +129,51 @@ export function StaffPage() {
                 <Label>รหัสผ่าน</Label>
                 <Input name="password" type="password" required />
               </div>
+
+              {/* ส่วนที่ 7.4: เลือกสิทธิ์พนักงาน — ส่งเป็น array ให้ backend
+                  (permissions: "all" = ทุกอย่าง, bills = ออกบิล, payments = รับชำระ) */}
+              <div className="space-y-2">
+                <Label>สิทธิ์การใช้งาน</Label>
+                <div className="flex gap-4 rounded-md border p-3">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      name="permAll"
+                      checked={permAll}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+
+                        setPermAll(checked);
+
+                        if (checked) {
+                          setPermBills(false);
+                          setPermPayments(false);
+                        }
+                      }}
+                    />
+                    ทุกอย่าง (all)
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={permBills}
+                      disabled={permAll}
+                      onChange={(event) => setPermBills(event.target.checked)}
+                    />
+                    ออกบิล (bills)
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={permPayments}
+                      disabled={permAll}
+                      onChange={(event) => setPermPayments(event.target.checked)}
+                    />
+                    รับชำระเงิน (payments)
+                  </label>
+                </div>
+              </div>
+
               <Button
                 type="submit"
                 disabled={saveState === "saving"}
@@ -150,6 +206,8 @@ export function StaffPage() {
                 <TableHead>ชื่อ-นามสกุล</TableHead>
                 <TableHead>ตำแหน่ง</TableHead>
                 <TableHead>เบอร์โทร</TableHead>
+                {/* ส่วนที่ 7.4: แสดงสิทธิ์ของพนักงานแต่ละคน */}
+                <TableHead>สิทธิ์</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -159,6 +217,26 @@ export function StaffPage() {
                   <TableCell className="font-medium">{item.fullName}</TableCell>
                   <TableCell>{item.position}</TableCell>
                   <TableCell>{item.phone || "-"}</TableCell>
+                  <TableCell className="text-sm">
+                    {/* ส่วนที่ 7.4: สิทธิ์ — ถ้าว่าง = ยังไม่ได้รัน migration */}
+                    {(() => {
+                      const perms = String(item.permissions || "").trim();
+
+                      if (!perms) return <span className="text-amber-700">ยังไม่กำหนด (รัน migrateColumns_)</span>;
+                      if (perms === "all") return "ทุกอย่าง";
+
+                      return perms
+                        .split(",")
+                        .map((part) =>
+                          part.trim() === "bills"
+                            ? "ออกบิล"
+                            : part.trim() === "payments"
+                              ? "รับชำระ"
+                              : part.trim()
+                        )
+                        .join(", ");
+                    })()}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>

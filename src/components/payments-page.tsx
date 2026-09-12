@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { CreditCard, Plus, Printer } from "lucide-react";
+import { CreditCard, Plus, Printer, Undo2 } from "lucide-react";
 import { useReactToPrint } from "react-to-print";
 import { api, money, thaiDate } from "@/lib/api";
 import type { Bill, Payment, Receipt } from "@/types";
@@ -30,6 +30,9 @@ export function PaymentsPage() {
   const [message, setMessage] = useState("");
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const receiptRef = useRef<HTMLDivElement>(null);
+  // ส่วนที่ 3.4: รายการชำระที่กำลังจะยกเลิก (voidPayment)
+  const [voidTarget, setVoidTarget] = useState<Payment | null>(null);
+  const [voidOpen, setVoidOpen] = useState(false);
 
   /* ข้อ 2.4: แสดงข้อความสำเร็จค้างไว้ 2.5 วินาทีแล้วกลับสู่ idle */
   function flashSuccess(text: string) {
@@ -113,6 +116,44 @@ export function PaymentsPage() {
       setSaveState("error");
     } finally {
       // ข้อ 2.4: รับประกันสถานะไม่ค้างที่ "saving" เสมอ
+      setSaveState((state) => (state === "saving" ? "idle" : state));
+    }
+  }
+
+  /* ส่วนที่ 3.4: ส่งยกเลิกการชำระเงิน (voidPayment) — admin only ที่ backend
+     ต้องกรอกเหตุผลเสมอ, backend จะลด paidAmount ของบิลและ mark voided = true */
+  async function submitVoidPayment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!voidTarget || saveState === "saving") return;
+
+    const reason = String(
+      new FormData(event.currentTarget).get("reason") || ""
+    ).trim();
+
+    if (!reason) {
+      setError("กรุณาระบุเหตุผลในการยกเลิกการชำระเงิน");
+      setSaveState("error");
+      return;
+    }
+
+    setSaveState("saving");
+    setError("");
+
+    try {
+      await api("voidPayment", {
+        paymentId: voidTarget.paymentId,
+        reason,
+      });
+
+      setVoidOpen(false);
+      setVoidTarget(null);
+      flashSuccess("ยกเลิกการชำระเงินสำเร็จ");
+      await loadData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "ยกเลิกการชำระเงินไม่สำเร็จ");
+      setSaveState("error");
+    } finally {
       setSaveState((state) => (state === "saving" ? "idle" : state));
     }
   }
@@ -239,14 +280,33 @@ export function PaymentsPage() {
                   </TableCell>
                   <TableCell>{thaiDate(payment.paidAt)}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => printReceipt(payment.paymentId)}
-                    >
-                      <Printer className="mr-1 h-4 w-4" />
-                      พิมพ์
-                    </Button>
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => printReceipt(payment.paymentId)}
+                      >
+                        <Printer className="mr-1 h-4 w-4" />
+                        พิมพ์
+                      </Button>
+
+                      {/* ส่วนที่ 3.4: ปุ่มยกเลิกการชำระเงิน (admin เท่านั้น)
+                          เปิด modal ให้กรอกเหตุผลก่อนเสมอ */}
+                      {user.role === "admin" && (
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          disabled={saveState === "saving"}
+                          onClick={() => {
+                            setVoidTarget(payment);
+                            setVoidOpen(true);
+                          }}
+                        >
+                          <Undo2 className="mr-1 h-4 w-4" />
+                          ยกเลิก
+                        </Button>
+                      )}
+                    </div>
                   </TableCell>
                   {user.role !== "member" && <TableCell>{payment.receivedByName}</TableCell>}
                 </TableRow>
@@ -259,6 +319,43 @@ export function PaymentsPage() {
       <div className="hidden">
         {receipt && <ReceiptDocument ref={receiptRef} receipt={receipt} />}
       </div>
+
+      {/* ส่วนที่ 3.4: Dialog ยืนยันยกเลิกการชำระเงิน — บังคับกรอกเหตุผล (ป้องกันกดพลาด)
+          backend จะลด paidAmount ของบิลและ mark voided = true โดยไม่ลบประวัติ */}
+      <Dialog open={voidOpen} onOpenChange={setVoidOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>ยืนยันการยกเลิกการชำระเงิน</DialogTitle>
+          </DialogHeader>
+
+          {voidTarget && (
+            <form onSubmit={submitVoidPayment} className="space-y-4">
+              <div className="rounded-md bg-amber-50 p-3 text-sm text-amber-800">
+                รายการ {voidTarget.paymentNo} — บิล {voidTarget.billNo} บ้าน {voidTarget.houseNo}
+                จำนวน {money(voidTarget.amount)}
+                <br />
+                <span className="text-xs">
+                  ระบบจะลดยอดชำระของบิลลงเท่ากับจำนวนนี้ และเก็บประวัติรายการไว้เพื่อการตรวจสอบ
+                </span>
+              </div>
+
+              <div className="space-y-2">
+                <Label>เหตุผลในการยกเลิก (บังคับกรอก)</Label>
+                <Textarea name="reason" placeholder="เช่น กรอกยอดผิด / รับซ้ำ" required />
+              </div>
+
+              <Button
+                type="submit"
+                disabled={saveState === "saving"}
+                variant="destructive"
+                className="w-full"
+              >
+                {saveState === "saving" ? "กำลังบันทึกข้อมูล..." : "ยืนยันยกเลิกการชำระเงิน"}
+              </Button>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
